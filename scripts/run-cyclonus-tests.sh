@@ -15,6 +15,7 @@
 # AWS_CNI_IMAGE_INIT: Optional
 
 set -euoE pipefail
+set -x
 DIR=$(cd "$(dirname "$0")"; pwd)
 GINKGO_TEST_BUILD_DIR="$DIR/../test/build"
 
@@ -104,7 +105,8 @@ if [[ $ENABLE_STRICT_MODE == "true" ]]; then
 
     echo "Check aws-node daemonset status"
     kubectl rollout status ds/aws-node -n kube-system --timeout=300s
-
+    echo "test cmd going to be exectued"
+    echo "ginkgo -v -timeout 15m $GINKGO_TEST_BUILD_DIR/strict.test --no-color --fail-on-pending -- --cluster-kubeconfig=$KUBE_CONFIG_PATH --cluster-name=$CLUSTER_NAME --test-image-registry=$TEST_IMAGE_REGISTRY --ip-family=$IP_FAMILY"
     CGO_ENABLED=0 ginkgo -v -timeout 15m $GINKGO_TEST_BUILD_DIR/strict.test --no-color --fail-on-pending -- --cluster-kubeconfig=$KUBE_CONFIG_PATH --cluster-name=$CLUSTER_NAME --test-image-registry=$TEST_IMAGE_REGISTRY --ip-family=$IP_FAMILY || TEST_FAILED="true"
 
 fi

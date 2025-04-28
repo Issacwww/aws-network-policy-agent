@@ -15,9 +15,15 @@
 # AWS_CNI_IMAGE_INIT: Optional
 
 set -euoE pipefail
-set -x
 DIR=$(cd "$(dirname "$0")"; pwd)
 GINKGO_TEST_BUILD_DIR="$DIR/../test/build"
+echo "Checking target dir $GINKGO_TEST_BUILD_DIR"
+ls $GINKGO_TEST_BUILD_DIR
+echo "Completed checking $GINKGO_TEST_BUILD_DIR"
+
+echo "Checking target dir repository"
+ls repository
+echo "Completed checking repository"
 
 source ${DIR}/lib/cleanup.sh
 source ${DIR}/lib/network-policy.sh

@@ -21,10 +21,6 @@ echo "Checking target dir $GINKGO_TEST_BUILD_DIR"
 ls $GINKGO_TEST_BUILD_DIR
 echo "Completed checking $GINKGO_TEST_BUILD_DIR"
 
-echo "Checking target dir repository"
-ls repository
-echo "Completed checking repository"
-
 source ${DIR}/lib/cleanup.sh
 source ${DIR}/lib/network-policy.sh
 source ${DIR}/lib/tests.sh

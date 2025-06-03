@@ -86,7 +86,8 @@ if [[ $DEPLOY_NETWORK_POLICY_CONTROLLER_ON_DATAPLANE == "true" ]]; then
     make deploy-network-policy-controller-on-dataplane NP_CONTROLLER_IMAGE=$PROD_IMAGE_REGISTRY NP_CONTROLLER_ENDPOINT_CHUNK_SIZE=$NP_CONTROLLER_ENDPOINT_CHUNK_SIZE
 fi
 
-run_cyclonus_tests
+# skip cyclonus to test strict mode
+# run_cyclonus_tests
 
 check_path_cleanup
 

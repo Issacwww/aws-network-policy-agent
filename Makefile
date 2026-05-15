@@ -2,7 +2,7 @@
 # Image URL to use all building/pushing image targets
 IMAGE ?= amazon/aws-network-policy-agent
 VERSION ?= $(shell git describe --tags --always --dirty || echo "unknown")
-IMAGE_NAME = $(IMAGE)$(IMAGE_ARCH_SUFFIX):$(VERSION)
+IMAGE_NAME ?= $(IMAGE)$(IMAGE_ARCH_SUFFIX):$(VERSION)
 GOLANG_VERSION ?= $(shell cat .go-version)
 GOLANG_IMAGE ?= public.ecr.aws/eks-distro-build-tooling/golang:$(GOLANG_VERSION)-gcc-al2
 # TEST_IMAGE is the testing environment container image.
@@ -12,7 +12,6 @@ MAKEFILE_PATH = $(dir $(realpath -s $(firstword $(MAKEFILE_LIST))))
 
 export GOPROXY = direct
 export GOSUMDB = sum.golang.org
-export GOTOOLCHAIN = go$(GOLANG_VERSION)
 
 # aws-ebpf-sdk-go override in case we need to build against a custom version
 EBPF_SDK_OVERRIDE ?= "n"
@@ -85,7 +84,7 @@ vet: setup-ebpf-sdk-override # Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./cmd/... ./controllers/... ./pkg/... -coverprofile cover.out -v -coverprofile=coverage.txt
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./pkg/... ./controllers/... -v -coverprofile=coverage.txt -covermode=atomic
 
 ##@ Build
 
@@ -256,7 +255,7 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.4.3
-CONTROLLER_TOOLS_VERSION ?= v0.16.3
+CONTROLLER_TOOLS_VERSION ?= v0.18.0
 
 KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 .PHONY: kustomize

@@ -91,14 +91,16 @@ fi
 
 check_path_cleanup
 
-if [[ $ENABLE_STRICT_MODE == "true" ]]; then
+if [[ $SKIP_MAKE_TEST_BINARIES == "false" ]]; then
+    echo "Making ginkgo test binaries"
+    (cd $DIR/../ && make build-test-binaries)
+else
+    echo "Skipping making ginkgo test binaries"
+fi
 
-    if [[ $SKIP_MAKE_TEST_BINARIES == "false" ]]; then
-        echo "Making ginkgo test binaries"
-        (cd $DIR/../ && make build-test-binaries)
-    else
-        echo "Skipping making ginkgo test binaries"
-    fi
+CGO_ENABLED=0 ginkgo -v -timeout 15m --no-color --fail-on-pending $GINKGO_TEST_BUILD_DIR/policy.test -- --cluster-kubeconfig=$KUBE_CONFIG_PATH --cluster-name=$CLUSTER_NAME --test-image-registry=$TEST_IMAGE_REGISTRY --ip-family=$IP_FAMILY || TEST_FAILED="true"
+
+if [[ $ENABLE_STRICT_MODE == "true" ]]; then
 
     echo "Enable network policy strict mode"
     kubectl set env daemonset aws-node -n kube-system -c aws-node NETWORK_POLICY_ENFORCING_MODE=strict

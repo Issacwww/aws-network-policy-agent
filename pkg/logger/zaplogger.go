@@ -29,8 +29,10 @@ type structuredLogger struct {
 
 // Configuration stores the config for the logger
 type Configuration struct {
-	LogLevel    string
-	LogLocation string
+	LogLevel          string
+	LogLocation       string
+	LogFileMaxSize    int
+	LogFileMaxBackups int
 }
 
 // getZapLevel converts log level string to zapcore.Level
@@ -59,22 +61,24 @@ func getEncoder() zapcore.Encoder {
 	return zapcore.NewJSONEncoder(encoderConfig)
 }
 
-func (logConfig *Configuration) newZapLogger() *structuredLogger { //Logger {
+// buildZapCore creates the common zapcore.Core used by all loggers
+func (logConfig *Configuration) buildZapCore() zapcore.Core {
 	var cores []zapcore.Core
 
 	logLevel := getZapLevel(logConfig.LogLevel)
 
-	writer := getLogFilePath(logConfig.LogLocation)
+	writer := getLogFilePath(logConfig.LogLocation, logConfig.LogFileMaxSize, logConfig.LogFileMaxBackups)
 
 	cores = append(cores, zapcore.NewCore(getEncoder(), writer, logLevel))
 
-	combinedCore := zapcore.NewTee(cores...)
+	return zapcore.NewTee(cores...)
+}
 
-	logger := zap.New(combinedCore,
+func (logConfig *Configuration) newZapLogger() *structuredLogger { //Logger {
+	logger := zap.New(logConfig.buildZapCore(),
 		zap.AddCaller(),
 		zap.AddCallerSkip(2),
 	)
-	defer logger.Sync()
 
 	sugar := logger.Sugar()
 	return &structuredLogger{
@@ -82,14 +86,20 @@ func (logConfig *Configuration) newZapLogger() *structuredLogger { //Logger {
 	}
 }
 
+// newZapLoggerForControllerRuntime creates a zap logger for controller-runtime
+// without AddCallerSkip since zapr handles caller skip internally
+func (logConfig *Configuration) newZapLoggerForControllerRuntime() *zap.Logger {
+	return zap.New(logConfig.buildZapCore(), zap.AddCaller())
+}
+
 // getLogFilePath returns the writer
-func getLogFilePath(logFilePath string) zapcore.WriteSyncer {
+func getLogFilePath(logFilePath string, logFileMaxSize int, logFileMaxBackups int) zapcore.WriteSyncer {
 	var writer zapcore.WriteSyncer
 
 	if logFilePath == "" {
 		writer = zapcore.Lock(os.Stderr)
 	} else if strings.ToLower(logFilePath) != "stdout" {
-		writer = getLogWriter(logFilePath)
+		writer = getLogWriter(logFilePath, logFileMaxSize, logFileMaxBackups)
 	} else {
 		writer = zapcore.Lock(os.Stdout)
 	}
@@ -98,11 +108,11 @@ func getLogFilePath(logFilePath string) zapcore.WriteSyncer {
 }
 
 // getLogWriter is for lumberjack
-func getLogWriter(logFilePath string) zapcore.WriteSyncer {
+func getLogWriter(logFilePath string, logFileMaxSize int, logFileMaxBackups int) zapcore.WriteSyncer {
 	lumberJackLogger := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    200,
-		MaxBackups: 8,
+		MaxSize:    logFileMaxSize,
+		MaxBackups: logFileMaxBackups,
 		MaxAge:     30,
 		Compress:   true,
 	}

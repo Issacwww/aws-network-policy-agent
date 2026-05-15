@@ -441,12 +441,81 @@ func TestGetPodIdentifierFromBPFPinPath(t *testing.T) {
 			},
 			want: [2]string{"hello-udp-748dc8d996-default", "egress"},
 		},
+		{
+			name: "Ingress Pinpath with podIdentifier name containing underscore",
+			args: args{
+				pinPath: "/sys/fs/bpf/globals/aws/programs/ylinux_app-75f4596489-k8s-omega-aws--nonprod-omega--test_handle_ingress",
+			},
+			want: [2]string{"ylinux_app-75f4596489-k8s-omega-aws--nonprod-omega--test", "ingress"},
+		},
+		{
+			name: "Egress Pinpath with podIdentifier name containing underscore",
+			args: args{
+				pinPath: "/sys/fs/bpf/globals/aws/programs/ylinux_app-75f4596489-k8s-omega-aws--nonprod-omega--test_handle_egress",
+			},
+			want: [2]string{"ylinux_app-75f4596489-k8s-omega-aws--nonprod-omega--test", "egress"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got1, got2 := GetPodIdentifierFromBPFPinPath(tt.args.pinPath)
 			assert.Equal(t, tt.want[0], got1)
 			assert.Equal(t, tt.want[1], got2)
+		})
+	}
+}
+
+func TestPodIdentifierDotConversion(t *testing.T) {
+	type args struct {
+		podName      string
+		podNamespace string
+		direction    string
+	}
+
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "Pod name with single dot",
+			args: args{
+				podName:      "my.pod-748dc8d996-fb8b2",
+				podNamespace: "default",
+				direction:    "ingress",
+			},
+		},
+		{
+			name: "Pod name with multiple dots",
+			args: args{
+				podName:      "ylinux.app.service-75f4596489-g4x8c",
+				podNamespace: "k8s-omega-aws--nonprod-omega--test",
+				direction:    "egress",
+			},
+		},
+		{
+			name: "Pod name without dots",
+			args: args{
+				podName:      "hello-udp-748dc8d996-fb8b2",
+				podNamespace: "default",
+				direction:    "ingress",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Step 1: Convert pod name to pod identifier (dots become underscores)
+			podIdentifier := GetPodIdentifier(tt.args.podName, tt.args.podNamespace)
+
+			// Step 2: Create BPF pin path from pod identifier
+			pinPath := GetBPFPinPathFromPodIdentifier(podIdentifier, tt.args.direction)
+
+			// Step 3: Extract pod identifier back from pin path
+			extractedPodId, extractedDirection := GetPodIdentifierFromBPFPinPath(pinPath)
+
+			// Verify round-trip: extracted values should match original
+			assert.Equal(t, podIdentifier, extractedPodId, "Pod identifier should match after round-trip")
+			assert.Equal(t, tt.args.direction, extractedDirection, "Direction should match after round-trip")
 		})
 	}
 }
@@ -496,7 +565,7 @@ func TestGetBPFMapPinPathFromPodIdentifier(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want string
+		want map[string]string
 	}{
 		{
 			name: "Sample Ingress PodIdentifier",
@@ -504,7 +573,10 @@ func TestGetBPFMapPinPathFromPodIdentifier(t *testing.T) {
 				podIdentifier: "hello-udp-748dc8d996-default",
 				direction:     "ingress",
 			},
-			want: "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_ingress_map",
+			want: map[string]string{
+				"network-policy":         "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_ingress_map",
+				"cluster-network-policy": "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_cp_ingress_map",
+			},
 		},
 		{
 			name: "Sample Egress PodIdentifier",
@@ -512,13 +584,17 @@ func TestGetBPFMapPinPathFromPodIdentifier(t *testing.T) {
 				podIdentifier: "hello-udp-748dc8d996-default",
 				direction:     "egress",
 			},
-			want: "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_egress_map",
+			want: map[string]string{
+				"network-policy":         "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_egress_map",
+				"cluster-network-policy": "/sys/fs/bpf/globals/aws/maps/hello-udp-748dc8d996-default_cp_egress_map",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := GetBPFMapPinPathFromPodIdentifier(tt.args.podIdentifier, tt.args.direction)
-			assert.Equal(t, tt.want, got)
+			npmap, cnpmap := GetBPFMapPinPathFromPodIdentifier(tt.args.podIdentifier, tt.args.direction)
+			assert.Equal(t, tt.want["network-policy"], npmap)
+			assert.Equal(t, tt.want["cluster-network-policy"], cnpmap)
 		})
 	}
 }
@@ -551,46 +627,6 @@ func TestGetPolicyEndpointIdentifier(t *testing.T) {
 	}
 }
 
-func TestIsCatchAllIPEntry(t *testing.T) {
-	type args struct {
-		ipAddr string
-	}
-
-	tests := []struct {
-		name string
-		args args
-		want bool
-	}{
-		{
-			name: "IPv4 Catch All IP Entry",
-			args: args{
-				ipAddr: "0.0.0.0/0",
-			},
-			want: true,
-		},
-		{
-			name: "IPv4 Host IP Entry",
-			args: args{
-				ipAddr: "1.1.1.1/32",
-			},
-			want: false,
-		},
-		{
-			name: "Random /m IPv4 CIDR",
-			args: args{
-				ipAddr: "1.1.1.2/24",
-			},
-			want: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := IsCatchAllIPEntry(tt.args.ipAddr)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
 func TestIsNonHostCIDR(t *testing.T) {
 	type args struct {
 		ipAddr string
@@ -606,7 +642,7 @@ func TestIsNonHostCIDR(t *testing.T) {
 			args: args{
 				ipAddr: "0.0.0.0/0",
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "IPv4 Host IP Entry",
@@ -697,7 +733,7 @@ func TestGetHostVethName(t *testing.T) {
 		}
 
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetHostVethName(tt.args.podName, tt.args.podNamespace, tt.args.interfacePrefix)
+			got, err := GetHostVethName(tt.args.podName, tt.args.podNamespace, 0, tt.args.interfacePrefix)
 			assert.Equal(t, tt.want, got)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)

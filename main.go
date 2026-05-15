@@ -17,9 +17,20 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 
+	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
+	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/rpc"
+	"github.com/aws/aws-network-policy-agent/pkg/rpcclient"
+	"github.com/aws/aws-network-policy-agent/pkg/utils"
+	"github.com/aws/aws-network-policy-agent/pkg/utils/imds"
+	"github.com/samber/lo"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 
@@ -27,12 +38,12 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/config"
-	"github.com/aws/aws-network-policy-agent/pkg/metrics"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -42,7 +53,9 @@ import (
 )
 
 var (
-	scheme = runtime.NewScheme()
+	scheme              = runtime.NewScheme()
+	LOCAL_IPAMD_ADDRESS = "127.0.0.1:50051"
+	npaSocketPath       = "/var/run/aws-node/npa.sock"
 )
 
 func init() {
@@ -53,18 +66,22 @@ func init() {
 }
 
 func main() {
-	initLogger := logger.New("info", "")
+	initLogger := logger.New("info", "", logger.DEFAULT_LOG_FILE_MAX_SIZE, logger.DEFAULT_LOG_FILE_MAX_BACKUPS)
 
 	ctrlConfig, err := loadControllerConfig()
 	if err != nil {
 		initLogger.Errorf("unable to load policy endpoint controller config %v", err)
 		os.Exit(1)
 	}
-
-	log := logger.New(ctrlConfig.LogLevel, ctrlConfig.LogFile)
+	log := logger.New(ctrlConfig.LogLevel, ctrlConfig.LogFile, ctrlConfig.LogFileMaxSize, ctrlConfig.LogFileMaxBackups)
 	log.Infof("Starting network policy agent with log level: %s", ctrlConfig.LogLevel)
 
 	ctrl.SetLogger(logger.GetControllerRuntimeLogger())
+	if ctrlConfig.EnableProfiling {
+		go func() {
+			log.Errorf("failed to setup pprof server: %v", http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
 	restCFG, err := config.BuildRestConfig(ctrlConfig.RuntimeConfig)
 	if err != nil {
 		log.Errorf("unable to build REST config %v", err)
@@ -85,23 +102,39 @@ func main() {
 	}
 
 	ctx := ctrl.SetupSignalHandler()
+
 	var policyEndpointController *controllers.PolicyEndpointsReconciler
+	var clusterPolicyEndpointController *controllers.ClusterPolicyEndpointsReconciler
 	if ctrlConfig.EnableNetworkPolicy {
-		log.Info("Network Policy is enabled, registering the policyEndpointController...")
-		policyEndpointController, err = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(),
-			ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
-			ctrlConfig.EnableIPv6, ctrlConfig.EnableNetworkPolicy, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize)
-		if err != nil {
-			log.Errorf("unable to setup controller, PolicyEndpoints init failed %v", err)
-			os.Exit(1)
+		log.Info("Network Policy is enabled, registering controllers...")
+
+		var nodeIP string
+		if !ctrlConfig.EnableIPv6 {
+			nodeIP = lo.Must1(imds.GetMetaData("local-ipv4"))
+		} else {
+			nodeIP = lo.Must1(imds.GetMetaData("ipv6"))
 		}
+
+		npMode, isMultiNICEnabled := lo.Must2(getNetworkPolicyConfigsFromIpamd(log))
+
+		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
+			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled))
+		ebpfClient.ReAttachEbpfProbes()
+
+		policyEndpointController = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6)
 
 		if err = policyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller PolicyEndpoints %v", err)
 			os.Exit(1)
 		}
+
+		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient)
+		if err = clusterPolicyEndpointController.SetupWithManager(ctx, mgr); err != nil {
+			log.Errorf("unable to create controller ClusterPolicyEndpoints %v", err)
+			os.Exit(1)
+		}
 	} else {
-		log.Info("Network Policy is disabled, skip the policyEndpointController registration")
+		log.Info("Network Policy is disabled, skip the controller registration")
 	}
 
 	//+kubebuilder:scaffold:builder
@@ -117,14 +150,18 @@ func main() {
 
 	// CNI makes rpc calls to NP agent regardless NP is enabled or not
 	// need to start rpc always
+	// todo: add a liveness probe to this gRPC server and remove closing based on this errCh, liveness probe will check and re-start this container
+	errCh, err := rpc.RunRPCHandler(policyEndpointController, clusterPolicyEndpointController, npaSocketPath)
+	if err != nil {
+		log.Errorf("Failed to set up gRPC Handler %v", err)
+		os.Exit(1)
+	}
 	go func() {
-		if err := rpc.RunRPCHandler(policyEndpointController); err != nil {
-			log.Errorf("Failed to set up gRPC Handler %v", err)
+		if err := <-errCh; err != nil {
+			log.Errorf("gRPC server stopped: %v", err)
 			os.Exit(1)
 		}
 	}()
-
-	go metrics.ServeMetrics()
 
 	log.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
@@ -145,4 +182,31 @@ func loadControllerConfig() (config.ControllerConfig, error) {
 	}
 
 	return controllerConfig, nil
+}
+
+func getNetworkPolicyConfigsFromIpamd(log logger.Logger) (string, bool, error) {
+	ctx := context.Background()
+
+	// grpc connection waits till the ipmad is up and running
+	log.Info("Trying to establish GRPC connection to ipamd")
+	grpcConn, err := rpcclient.New().Dial(ctx, LOCAL_IPAMD_ADDRESS, rpcclient.GetDefaultServiceRetryConfig(), rpcclient.GetInsecureConnectionType())
+	if err != nil {
+		log.Errorf("Failed to connect to ipamd %v", err)
+		return "", false, err
+	}
+	defer grpcConn.Close()
+
+	ipamd := cnirpc.NewConfigServerBackendClient(grpcConn)
+	resp, err := ipamd.GetNetworkPolicyConfigs(ctx, &emptypb.Empty{})
+	if err != nil {
+		log.Errorf("Failed to get network policy configs %v", err)
+		return "", false, err
+	}
+	log.Infof("Connected to ipamd grpc endpoint. NetworkPolicyMode: %s MultiNICEnabled: %v", resp.NetworkPolicyMode, resp.MultiNICEnabled)
+	if !utils.IsValidNetworkPolicyEnforcingMode(resp.NetworkPolicyMode) {
+		err = errors.New("Invalid Network Policy Mode")
+		log.Errorf("Invalid Network Policy Mode from ipamd %s error: %v", resp.NetworkPolicyMode, err)
+		return "", false, err
+	}
+	return resp.NetworkPolicyMode, resp.MultiNICEnabled, nil
 }

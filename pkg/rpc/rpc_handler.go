@@ -16,9 +16,10 @@ package rpc
 import (
 	"context"
 	"net"
-	"sync"
+	"os"
 
 	"github.com/aws/aws-network-policy-agent/controllers"
+	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 
@@ -35,34 +36,43 @@ func log() logger.Logger {
 	return logger.Get()
 }
 
-var (
-	POLICIES_APPLIED = 0
-	DEFAULT_ALLOW    = 1
-	DEFAULT_DENY     = 2
-)
-
 const (
-	npgRPCaddress         = "127.0.0.1:50052"
 	grpcHealthServiceName = "grpc.health.v1.np-agent"
 )
 
 // server controls RPC service responses.
 type server struct {
-	policyReconciler *controllers.PolicyEndpointsReconciler
+	policyReconciler        *controllers.PolicyEndpointsReconciler
+	clusterPolicyReconciler *controllers.ClusterPolicyEndpointsReconciler
+	rpc.UnimplementedNPBackendServer
 }
 
 // EnforceNpToPod processes CNI Enforce NP network request
 func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (*rpc.EnforceNpReply, error) {
-	if s.policyReconciler == nil || s.policyReconciler.GeteBPFClient() == nil {
+	// If NPA is disabled, controllers are nil. The gRPC server still runs to serve CNI requests,
+	// so return success without enforcing any policy.
+	var err error
+	peReconcilerReady := s.policyReconciler != nil && s.policyReconciler.GeteBPFClient() != nil
+	cpeReconcilerReady := s.clusterPolicyReconciler != nil && s.clusterPolicyReconciler.GeteBPFClient() != nil
+
+	if !peReconcilerReady && !cpeReconcilerReady {
 		log().Debug("Network policy is disabled, returning success")
-		success := rpc.EnforceNpReply{
+		response := rpc.EnforceNpReply{
 			Success: true,
 		}
-		return &success, nil
+		return &response, nil
+	}
+
+	if peReconcilerReady != cpeReconcilerReady {
+		err = errors.New("One of the policy reconcilers is not ready")
+		log().Errorf("One of the policy reconcilers is not ready, policyReconcilerReady: %t, clusterPolicyReconcilerReady: %t", peReconcilerReady, cpeReconcilerReady)
+		response := rpc.EnforceNpReply{
+			Success: false,
+		}
+		return &response, err
 	}
 
 	log().Infof("Received Enforce Network Policy Request for Pod: %s Namespace: %s Mode: %s", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, in.NETWORK_POLICY_MODE)
-	var err error
 
 	if !utils.IsValidNetworkPolicyEnforcingMode(in.NETWORK_POLICY_MODE) {
 		err = errors.New("Invalid Network Policy Mode")
@@ -70,15 +80,24 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 		return nil, err
 	}
 
-	s.policyReconciler.SetNetworkPolicyMode(in.NETWORK_POLICY_MODE)
 	podIdentifier := utils.GetPodIdentifier(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
 	isFirstPodInPodIdentifier := s.policyReconciler.GeteBPFClient().IsFirstPodInPodIdentifier(podIdentifier)
+	s.policyReconciler.GeteBPFClient().ClearDeletedPod(utils.GetPodNamespacedName(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE))
 	err = s.policyReconciler.GeteBPFClient().AttacheBPFProbes(types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE},
-		podIdentifier)
+		podIdentifier, int(in.InterfaceCount))
 	if err != nil {
 		log().Errorf("Attaching eBPF probe failed for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
 		return nil, err
 	}
+	var podState, clusterPolicyState int
+
+	if utils.IsStrictMode(in.NETWORK_POLICY_MODE) {
+		podState = ebpf.DEFAULT_DENY
+	} else {
+		podState = ebpf.DEFAULT_ALLOW
+	}
+
+	clusterPolicyState = ebpf.DEFAULT_ALLOW
 
 	// We attempt to program eBPF firewall map entries for this pod, if the local agent is aware of the policies
 	// configured against it. For example, if this is a new replica of an existing pod/deployment then the local
@@ -89,39 +108,71 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 	// Check if there are active policies against the new pod and if there are other pods on the local node that share
 	// the eBPF firewall maps with the newly launched pod, if already present we can skip the map update and return
 	policiesAvailableInLocalCache := s.policyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
-	if policiesAvailableInLocalCache && isFirstPodInPodIdentifier {
+	clusterPolicyAvailableInLocalCache := s.clusterPolicyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
+
+	if (policiesAvailableInLocalCache || clusterPolicyAvailableInLocalCache) && isFirstPodInPodIdentifier {
 		// If we're here, then the local agent knows the list of active policies that apply to this pod and
 		// this is the first pod of it's type to land on the local node/cluster
 		log().Info("Active policies present against this pod and this is a new Pod to the local node, configuring firewall rules....")
 
-		//Derive Ingress and Egress Firewall Rules and Update the relevant eBPF maps
-		ingressRules, egressRules, _ :=
-			s.policyReconciler.DeriveFireWallRulesPerPodIdentifier(podIdentifier, in.K8S_POD_NAMESPACE)
+		if policiesAvailableInLocalCache {
+			//Derive Ingress and Egress Firewall Rules and Update the relevant eBPF maps
+			ingressRules, egressRules, _ :=
+				s.policyReconciler.DeriveFireWallRulesPerPodIdentifier(podIdentifier, in.K8S_POD_NAMESPACE)
 
-		err = s.policyReconciler.GeteBPFClient().UpdateEbpfMaps(podIdentifier, ingressRules, egressRules)
+			err = s.policyReconciler.GeteBPFClient().UpdateEbpfMaps(podIdentifier, ingressRules, egressRules)
+			if err != nil {
+				log().Errorf("Network Policy map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
+				return nil, err
+			}
+			podState = ebpf.POLICIES_APPLIED
+		}
+
+		if clusterPolicyAvailableInLocalCache {
+
+			clusterIngressRules, clusterEgressRules, _ :=
+				s.clusterPolicyReconciler.DeriveClusterPolicyFireWallRulesPerPodIdentifier(ctx, podIdentifier)
+
+			err = s.clusterPolicyReconciler.GeteBPFClient().UpdateClusterPolicyEbpfMaps(podIdentifier, clusterIngressRules, clusterEgressRules)
+			if err != nil {
+				log().Errorf("Cluster Policy map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
+				return nil, err
+			}
+			clusterPolicyState = ebpf.POLICIES_APPLIED
+		}
+
+		err = s.policyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, ebpf.POD_STATE_MAP_KEY, podState, true, true)
 		if err != nil {
-			log().Errorf("Map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
+			log().Errorf("Pod state map update failed for podIdentifier: %s, while updating network policy state, error: %v", podIdentifier, err)
 			return nil, err
 		}
+
+		err = s.clusterPolicyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, ebpf.CLUSTER_POLICY_POD_STATE_MAP_KEY, clusterPolicyState, true, true)
+		if err != nil {
+			log().Errorf("Pod state map update failed for podIdentifier: %s updating cluster network policy state, error: %v", podIdentifier, err)
+			return nil, err
+		}
+
 	} else {
 		// If no active policies present against this pod identifier, set pod_state to default_allow or default_deny
-		if !policiesAvailableInLocalCache {
+		if !(policiesAvailableInLocalCache || clusterPolicyAvailableInLocalCache) {
+
 			log().Debugf("No active policies present for podIdentifier: %s", podIdentifier)
-			if utils.IsStrictMode(in.NETWORK_POLICY_MODE) {
-				log().Infof("Updating pod_state map to default_deny for podIdentifier: %s", podIdentifier)
-				err = s.policyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, DEFAULT_DENY, true, true)
-				if err != nil {
-					log().Errorf("Map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
-					return nil, err
-				}
-			} else {
-				log().Infof("Updating pod_state map to default_allow for podIdentifier: %s", podIdentifier)
-				err = s.policyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, DEFAULT_ALLOW, true, true)
-				if err != nil {
-					log().Errorf("Map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
-					return nil, err
-				}
+			log().Infof("Updating pod_state map to default allow/default deny for podIdentifier: %s for network policy state, value: %d", podIdentifier, podState)
+			err = s.policyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, ebpf.POD_STATE_MAP_KEY, podState, true, true)
+			if err != nil {
+				log().Errorf("Pod state map update failed for podIdentifier: %s, while updating network policy state, error: %v", podIdentifier, err)
+				return nil, err
 			}
+
+			log().Infof("Updating pod_state map to default allow for podIdentifier: %s, for cluster network policy state, value: %d", podIdentifier, ebpf.DEFAULT_ALLOW)
+			// No concept of default deny for cluster policies. Either we have a rule that allows or denies traffic
+			err = s.clusterPolicyReconciler.GeteBPFClient().UpdatePodStateEbpfMaps(podIdentifier, ebpf.CLUSTER_POLICY_POD_STATE_MAP_KEY, ebpf.DEFAULT_ALLOW, true, true)
+			if err != nil {
+				log().Errorf("Pod state map update failed for podIdentifier: %s while updating cluster network policy state, error: %v", podIdentifier, err)
+				return nil, err
+			}
+
 		} else {
 			log().Info("Pod shares the eBPF firewall maps with other local pods. No Map update required..")
 		}
@@ -135,6 +186,7 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 
 // DeletePodNp processes CNI Delete Pod NP network request
 func (s *server) DeletePodNp(ctx context.Context, in *rpc.DeleteNpRequest) (*rpc.DeleteNpReply, error) {
+	// We don't need CPE reconciler check here, since we only need one client during the deletion flow to delete the relevant BPF probes and map entries from bpfclient
 	if s.policyReconciler == nil || s.policyReconciler.GeteBPFClient() == nil {
 		log().Debug("Network policy is disabled, returning success")
 		success := rpc.DeleteNpReply{
@@ -144,27 +196,15 @@ func (s *server) DeletePodNp(ctx context.Context, in *rpc.DeleteNpRequest) (*rpc
 	}
 
 	log().Infof("Received Delete Network Policy Request for Pod: %s Namespace: %s", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
-	var err error
 	podIdentifier := utils.GetPodIdentifier(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
+	pod := types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE}
 
-	value, _ := s.policyReconciler.GeteBPFClient().GetDeletePodIdentifierLockMap().LoadOrStore(podIdentifier, &sync.Mutex{})
-	deletePodIdentifierLock := value.(*sync.Mutex)
-	deletePodIdentifierLock.Lock()
-	log().Debugf("Got the deletePodIdentifierLock for Pod: %s Namespace: %s PodIdentifier: %s", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, podIdentifier)
-
-	isProgFdShared, err := s.policyReconciler.IsProgFdShared(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
-	s.policyReconciler.GeteBPFClient().DeletePodFromIngressProgPodCaches(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
-	s.policyReconciler.GeteBPFClient().DeletePodFromEgressProgPodCaches(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
-	if err == nil && !isProgFdShared {
-		err = s.policyReconciler.GeteBPFClient().DeleteBPFProgramAndMaps(podIdentifier)
-		if err != nil {
-			log().Errorf("BPF programs and Maps delete failed for podIdentifier: %s, error: %v", podIdentifier, err)
-		}
-		deletePodIdentifierLock.Unlock()
-		s.policyReconciler.GeteBPFClient().GetDeletePodIdentifierLockMap().Delete(podIdentifier)
-	} else {
-		deletePodIdentifierLock.Unlock()
+	err := s.policyReconciler.GeteBPFClient().DeleteBPFProbes(pod, podIdentifier)
+	if err != nil {
+		log().Errorf("Failed to delete BPF probes for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
+		return &rpc.DeleteNpReply{Success: false}, err
 	}
+
 	resp := rpc.DeleteNpReply{
 		Success: true,
 	}
@@ -172,15 +212,24 @@ func (s *server) DeletePodNp(ctx context.Context, in *rpc.DeleteNpRequest) (*rpc
 }
 
 // RunRPCHandler handles request from gRPC
-func RunRPCHandler(policyReconciler *controllers.PolicyEndpointsReconciler) error {
-	log().Infof("Serving RPC Handler on Address: %s", npgRPCaddress)
-	listener, err := net.Listen("tcp", npgRPCaddress)
+func RunRPCHandler(policyReconciler *controllers.PolicyEndpointsReconciler, clusterPolicyReconciler *controllers.ClusterPolicyEndpointsReconciler, npaSocketPath string) (<-chan error, error) {
+	log().Infof("Serving RPC Handler on Unix socket: %s", npaSocketPath)
+
+	if _, err := os.Stat(npaSocketPath); err == nil {
+		log().Infof("Removing stale socket file: %s", npaSocketPath)
+		err = os.Remove(npaSocketPath)
+		if err != nil {
+			log().Warnf("got error in removing socket file %v", err)
+		}
+	}
+
+	listener, err := net.Listen("unix", npaSocketPath)
 	if err != nil {
-		log().Errorf("Failed to listen gRPC port: %v", err)
-		return errors.Wrap(err, "network policy agent: failed to listen to gRPC port")
+		log().Errorf("Failed to listen on unix socket: %v", err)
+		return nil, errors.Wrap(err, "network policy agent: failed to listen on unix socket")
 	}
 	grpcServer := grpc.NewServer()
-	rpc.RegisterNPBackendServer(grpcServer, &server{policyReconciler: policyReconciler})
+	rpc.RegisterNPBackendServer(grpcServer, &server{policyReconciler: policyReconciler, clusterPolicyReconciler: clusterPolicyReconciler})
 	healthServer := health.NewServer()
 	// No need to ever change this to HealthCheckResponse_NOT_SERVING since it's a local service only
 	healthServer.SetServingStatus(grpcHealthServiceName, healthpb.HealthCheckResponse_SERVING)
@@ -188,10 +237,13 @@ func RunRPCHandler(policyReconciler *controllers.PolicyEndpointsReconciler) erro
 
 	// Register reflection service on gRPC server.
 	reflection.Register(grpcServer)
-	if err := grpcServer.Serve(listener); err != nil {
-		log().Errorf("Failed to start server on gRPC port: %v", err)
-		return errors.Wrap(err, "network policy agent: failed to start server on gPRC port")
-	}
+	errCh := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			errCh <- errors.Wrap(err, "network policy agent: grpc serve failed")
+		}
+		close(errCh)
+	}()
 	log().Info("Done with RPC Handler initialization")
-	return nil
+	return errCh, nil
 }

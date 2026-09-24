@@ -1,4 +1,7 @@
 # aws-network-policy-agent
+
+[![codecov](https://codecov.io/github/aws/aws-network-policy-agent/branch/main/graph/badge.svg?token=3JKMW2BGBO)](https://codecov.io/github/aws/aws-network-policy-agent)
+
 Amazon EKS Network Policy Agent is a daemonset that is responsible for enforcing configured network policies on the cluster. Network policy support is a feature of the [Amazon VPC CNI](https://github.com/aws/amazon-vpc-cni-k8s). 
 
 [Network Policy Controller](https://github.com/aws/amazon-network-policy-controller-k8s/) resolves the configured network policies and publishes the resolved endpoints via Custom CRD (`PolicyEndpoints`) resource. Network Policy agent derives the endpoints from PolicyEndpoint resources and enforces them via eBPF probes attached to pod's host Veth interface.
@@ -58,15 +61,22 @@ This feature requires you to provide relevant Cloudwatch permissions to `aws-nod
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "VisualEditor0",
+            "Sid": "CloudWatchLogsWrites",
             "Effect": "Allow",
             "Action": [
-                "logs:DescribeLogGroups",
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
                 "logs:PutLogEvents"
             ],
-            "Resource": "*"
+            "Resource": [
+                "arn:aws:logs:<region-code>:<aws-account-id>:log-group:/aws/eks/<cluster-name>/cluster:*"
+            ]
+        },
+        {
+            "Sid": "CloudWatchLogsReads",
+            "Effect": "Allow",
+            "Action": "logs:DescribeLogGroups",
+            "Resource": "arn:aws:logs:<region-code>:<aws-account-id>:log-group::log-stream*"
         }
     ]
 }

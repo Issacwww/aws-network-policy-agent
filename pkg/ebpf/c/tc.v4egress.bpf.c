@@ -85,10 +85,12 @@ struct conntrack_key {
    __u16 dest_port;
    __u8  protocol;
    __u32 owner_ip;
+   __u32 ifindex;
 };
 
 struct conntrack_value {
-   __u8 val; // 0 => default-allow, 1 => policies-applied
+   __u64 val; // the pod's network policy and cluster policy state pair
+   __u64 last_seen; // monotonic ns when the datapath last saw this flow
 };
 
 struct data_t {
@@ -222,6 +224,7 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
 
 		struct conntrack_value flow_val = {};
+		flow_val.last_seen = bpf_ktime_get_ns();
 
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
@@ -411,6 +414,8 @@ int handle_egress(struct __sk_buff *skb)
 		flow_key.dest_port = l4_dst_port;
 		flow_key.protocol = ip->protocol;
 		flow_key.owner_ip = ip->saddr;
+		// ifindex scopes conntrack entries to this pod's veth, preventing cross-pod poisoning
+		flow_key.ifindex = skb->ifindex;
 
 		struct data_t evt = {};
 		evt.src_ip = flow_key.src_ip;
@@ -443,6 +448,11 @@ int handle_egress(struct __sk_buff *skb)
 		if (flow_val != NULL) {
 			// If the pod state matches, allow the packet
 			if (flow_val->val == ct_pod_state_val) {
+				// bpf_map_lookup_elem returns a pointer into the map's value
+				// memory, so this store updates the entry in place and no
+				// bpf_map_update_elem is needed. Refreshing last_seen here is
+				// what lets the userspace GC tell a reused flow from a stale one.
+				flow_val->last_seen = bpf_ktime_get_ns();
 				return BPF_OK;
 			}
 
@@ -464,11 +474,14 @@ int handle_egress(struct __sk_buff *skb)
 		reverse_flow_key.dest_port = l4_src_port;
 		reverse_flow_key.protocol = ip->protocol;
 		reverse_flow_key.owner_ip = ip->saddr;
+		reverse_flow_key.ifindex = skb->ifindex; // same veth for both directions in TC
 
 		//Check if it's a response packet
 		reverse_flow_val = bpf_map_lookup_elem(&aws_conntrack_map, &reverse_flow_key);
 
 		if (reverse_flow_val != NULL) {
+			// Stored in place through the map value pointer, as above.
+			reverse_flow_val->last_seen = bpf_ktime_get_ns();
 			return BPF_OK;
 		}
 
@@ -478,4 +491,5 @@ int handle_egress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
+const volatile __u32 NPA_FILE_VERSION = 2;
 char _license[] SEC("license") = "GPL";

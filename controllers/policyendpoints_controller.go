@@ -126,6 +126,10 @@ type PolicyEndpointsReconciler struct {
 	// stale PolicyEndpoint annotations and avoid emitting artificially high
 	// E2E latency on restart
 	trackerStartTime time.Time
+	// lastObservedTriggerTimes maps a PE's types.NamespacedName to the last
+	// last-change-trigger-time annotation value consumed, so each trigger
+	// time is observed at most once
+	lastObservedTriggerTimes sync.Map
 	// Maps pod Identifier to list of PolicyEndpoint resources
 	podIdentifierToPolicyEndpointMap sync.Map
 	// Mutex for operations on PodIdentifierToPolicyEndpointMap
@@ -170,6 +174,8 @@ func (r *PolicyEndpointsReconciler) cleanUpPolicyEndpoint(ctx context.Context, r
 	log().Infof("Clean Up PolicyEndpoint resources for name: %s", req.NamespacedName.Name)
 	policyEndpointIdentifier := utils.GetPolicyEndpointIdentifier(req.NamespacedName.Name,
 		req.NamespacedName.Namespace)
+
+	r.lastObservedTriggerTimes.Delete(req.NamespacedName)
 
 	start := time.Now()
 
@@ -259,6 +265,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 		return err
 	}
 
+	programmingSucceeded := true
 	for podIdentifier := range podIdentifiers {
 		// Derive Ingress IPs from the PolicyEndpoint
 		ingressRules, egressRules, isIngressIsolated, isEgressIsolated, err := r.deriveIngressAndEgressFirewallRules(ctx, podIdentifier,
@@ -284,23 +291,23 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 		err = r.configureeBPFProbes(ctx, podIdentifier, targetPods, ingressRules, egressRules)
 		if err != nil {
 			log().Errorf("Error configuring eBPF Probes %v", err)
+			programmingSucceeded = false
 		}
 		duration := msSince(start)
 		policySetupLatency.WithLabelValues(policyEndpoint.Name, policyEndpoint.Namespace).Observe(duration)
 	}
 
-	// Observe E2E policy programming latency (NPC change → NPA eBPF programmed).
-	// Only emit if the annotation timestamp is after this agent's start time to
-	// avoid stale latency on restart/new node (same pattern as kube-proxy).
-	r.observePolicyProgrammingLatency(policyEndpoint)
+	// Observe E2E policy programming latency (NPC change → NPA eBPF programmed)
+	r.observePolicyProgrammingLatency(policyEndpoint, programmingSucceeded)
 
 	return nil
 }
 
-// observePolicyProgrammingLatency reads the last-change-trigger-time annotation
-// from the PolicyEndpoint and emits the E2E latency histogram if the timestamp
-// is newer than this agent's start time.
-func (r *PolicyEndpointsReconciler) observePolicyProgrammingLatency(pe *policyk8sawsv1.PolicyEndpoint) {
+// observePolicyProgrammingLatency emits the E2E latency histogram from the
+// last-change-trigger-time annotation. Each annotation value is consumed at
+// most once per PE, even when the observation is suppressed (programming
+// failure, clock skew), so stale rewrites/resyncs/relists never re-observe it.
+func (r *PolicyEndpointsReconciler) observePolicyProgrammingLatency(pe *policyk8sawsv1.PolicyEndpoint, programmingSucceeded bool) {
 	if pe.Annotations == nil {
 		return
 	}
@@ -316,7 +323,23 @@ func (r *PolicyEndpointsReconciler) observePolicyProgrammingLatency(pe *policyk8
 	if !triggerTime.After(r.trackerStartTime) {
 		return
 	}
+	peKey := types.NamespacedName{Namespace: pe.Namespace, Name: pe.Name}
+	if prev, ok := r.lastObservedTriggerTimes.Load(peKey); ok && prev.(string) == triggerTimeStr {
+		return
+	}
+	// Consume before the suppression checks below: a suppressed observation
+	// must never be re-emitted (inflated) by a later resync of the same annotation.
+	r.lastObservedTriggerTimes.Store(peKey, triggerTimeStr)
+	if !programmingSucceeded {
+		log().Debugf("Skipping E2E policy programming latency for PE %s/%s: programming failed", pe.Namespace, pe.Name)
+		return
+	}
 	latency := time.Since(triggerTime).Seconds()
+	if latency < 0 {
+		// Clock skew between NPC (control plane) and this node
+		log().Debugf("Skipping negative E2E policy programming latency %.3fs for PE %s/%s", latency, pe.Namespace, pe.Name)
+		return
+	}
 	policyProgrammingLatency.Observe(latency)
 	log().Debugf("E2E policy programming latency: %.3fs for PE %s/%s", latency, pe.Namespace, pe.Name)
 }
@@ -394,10 +417,18 @@ func (r *PolicyEndpointsReconciler) cleanupPod(ctx context.Context, targetPod np
 			// Update the Maps and move on
 			log().Infof("Active policies against this pod. Skip Detaching probes and Update Maps... ")
 			if noActiveIngressPolicies {
-				// No active ingress rules for this pod, but we only should land here
-				// if there are active egress rules. So, we need to add an allow-all entry to ingress rule set
+				// Add an allow-all entry to ingress rule set so ingress traffic
+				// isn't dropped by the eBPF dataplane.
 				log().Info("No Ingress rules and no ingress isolation - Appending catch all entry")
 				r.addCatchAllEntry(&ingressRules)
+			}
+			if noActiveEgressPolicies {
+				// Add an allow-all entry to egress rule set so egress traffic
+				// isn't dropped by the eBPF dataplane. Without this, egress_map
+				// ends up not having the catch all rule while pod_state_map stays
+				// at POLICIES_APPLIED and the eBPF dataplane drops all egress traffic.
+				log().Info("No Egress rules and no egress isolation - Appending catch all entry")
+				r.addCatchAllEntry(&egressRules)
 			}
 
 			err = r.updateeBPFMaps(podIdentifier, ingressRules, egressRules, ebpf.POLICIES_APPLIED)
@@ -515,7 +546,10 @@ func (r *PolicyEndpointsReconciler) updateeBPFMaps(podIdentifier string,
 		return err
 	}
 
-	r.ebpfClient.CreatePodStateEbpfEntryIfNotExists(podIdentifier, ebpf.CLUSTER_POLICY_POD_STATE_MAP_KEY, ebpf.DEFAULT_ALLOW)
+	if err := r.ebpfClient.CreatePodStateEbpfEntryIfNotExists(podIdentifier, ebpf.CLUSTER_POLICY_POD_STATE_MAP_KEY, ebpf.DEFAULT_ALLOW); err != nil {
+		log().Errorf("Cluster policy pod-state seed failed for podIdentifier %s: %v", podIdentifier, err)
+		return err
+	}
 	return nil
 }
 

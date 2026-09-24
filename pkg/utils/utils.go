@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -47,6 +48,18 @@ var (
 	ErrInvalidFilterList                 = "failed to get filter list"
 	ErrMissingFilter                     = "no active filter to detach"
 )
+
+// NamespacedBPFMaps lists BPF map names that are pinned per pod-identifier
+// rather than globally.
+// Any new pod scoped eBPF maps added in ebpf C programs needs to be added in this list for recovery
+var NamespacedBPFMaps = []string{
+	TC_INGRESS_MAP,
+	TC_EGRESS_MAP,
+	TC_CLUSTER_POLICY_INGRESS_MAP,
+	TC_CLUSTER_POLICY_EGRESS_MAP,
+	TC_INGRESS_POD_STATE_MAP,
+	TC_EGRESS_POD_STATE_MAP,
+}
 
 func log() logger.Logger {
 	return logger.Get()
@@ -150,16 +163,41 @@ func (t Tier) Index() int {
 }
 
 func GetPodNamespacedName(podName, podNamespace string) string {
-	return podName + podNamespace
+	// "_" is forbidden in DNS-1123 pod names and namespaces, so this separator
+	// makes the key injective on (podName, podNamespace). "_" is also pin-path
+	// safe (no filesystem meaning), matching the convention used in
+	// GetPodIdentifier where "." is substituted with "_" for the same reason.
+	return podName + "_" + podNamespace
 }
 
+// Separator is "@" because it is illegal in DNS-1123 pod names and namespaces,
+// making the identifier injective on (podName-prefix, podNamespace). "@" also
+// keeps pin filenames parseable by aws-ebpf-sdk-go, which splits on the first
+// "_" to find the suffix boundary; using "_" here would shadow that split.
 func GetPodIdentifier(podName, podNamespace string) string {
 	if strings.Contains(podName, ".") {
 		log().Debug("Replacing '.' character with '_' for pod pin path.")
 		podName = strings.Replace(podName, ".", "_", -1)
 	}
 	podIdentifierPrefix := podName
-	if strings.Contains(string(podName), "-") {
+	if strings.Contains(podName, "-") {
+		tmpName := strings.Split(podName, "-")
+		podIdentifierPrefix = strings.Join(tmpName[:len(tmpName)-1], "-")
+	}
+	return podIdentifierPrefix + "@" + podNamespace
+}
+
+// LegacyGetPodIdentifier replicates the pre-fix GetPodIdentifier algorithm
+// with the "-" separator. Used only by the legacy bpffs pin migration to
+// compute what a previously-running agent would have produced for a given
+// (podName, podNamespace) pair.
+// TODO: remove after the migration window closes.
+func LegacyGetPodIdentifier(podName, podNamespace string) string {
+	if strings.Contains(podName, ".") {
+		podName = strings.Replace(podName, ".", "_", -1)
+	}
+	podIdentifierPrefix := podName
+	if strings.Contains(podName, "-") {
 		tmpName := strings.Split(podName, "-")
 		podIdentifierPrefix = strings.Join(tmpName[:len(tmpName)-1], "-")
 	}
@@ -519,6 +557,7 @@ type ConntrackKeyV6 struct {
 	Protocol    uint8
 	_           uint8    //Padding
 	Owner_ip    [16]byte //16
+	Ifindex     uint32
 }
 
 type ConntrackKey struct {
@@ -530,10 +569,24 @@ type ConntrackKey struct {
 	Protocol    uint8
 	_           uint8 //Padding
 	Owner_ip    uint32
+	Ifindex     uint32
 }
 
+// ConntrackVal mirrors struct conntrack_value in the TC programs. The layout
+// must stay in sync with the C definition.
 type ConntrackVal struct {
-	Value uint8
+	Value    uint64 // the pod's network policy and cluster policy state pair
+	LastSeen uint64 // monotonic ns when the datapath last saw this flow
+}
+
+// KtimeGetNs returns CLOCK_MONOTONIC nanoseconds. This is the clock
+// bpf_ktime_get_ns() reads, so values are comparable with BPF timestamps.
+func KtimeGetNs() (uint64, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return 0, err
+	}
+	return uint64(ts.Nano()), nil
 }
 
 func ConvConntrackV6ToByte(key ConntrackKeyV6) []byte {

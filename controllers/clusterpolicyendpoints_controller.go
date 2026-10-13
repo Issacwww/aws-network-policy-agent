@@ -266,10 +266,16 @@ func (r *ClusterPolicyEndpointsReconciler) observeClusterPolicyProgrammingLatenc
 
 func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podIdentifier string, targetPods []npatypes.Pod, ingressRules, egressRules []fwrp.EbpfFirewallRules) error {
 	ipEgressRules := egressRules
+	var domainRules []fwrp.EbpfFirewallRules
 	if r.domainFilter != nil {
-		domainRules, splitIPRules := fwrp.SplitDomainAndIPRules(egressRules)
-		r.domainFilter.SetRules(podIdentifier, filter.ClusterPolicyEndpointSource, domainRules)
+		var splitIPRules []fwrp.EbpfFirewallRules
+		domainRules, splitIPRules = fwrp.SplitDomainAndIPRules(egressRules)
 		ipEgressRules = splitIPRules
+		if err := disableDNSPolicyForPods(
+			r.domainFilter, r.proxyManager, filter.ClusterPolicyEndpointSource, podIdentifier, targetPods,
+		); err != nil {
+			return err
+		}
 	}
 
 	for _, pod := range targetPods {
@@ -284,11 +290,6 @@ func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podId
 			return err
 		}
 		log().Infof("Successfully attached required eBPF probes for pod: %s in namespace %s", pod.Name, pod.Namespace)
-		if r.proxyManager != nil {
-			if err := r.proxyManager.SyncPod(pod, podIdentifier); err != nil {
-				return err
-			}
-		}
 	}
 
 	err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, ipEgressRules)
@@ -297,7 +298,9 @@ func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podId
 		return err
 	}
 
-	return nil
+	return syncDNSPolicyForPods(
+		r.domainFilter, r.proxyManager, filter.ClusterPolicyEndpointSource, podIdentifier, domainRules, targetPods,
+	)
 }
 
 func (r *ClusterPolicyEndpointsReconciler) updateClusterPolicyBPFMaps(podIdentifier string, ingressRules, egressRules []fwrp.EbpfFirewallRules) error {
@@ -493,18 +496,33 @@ func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.C
 			return err
 		}
 		ipEgressRules := egressRules
+		var domainRules []fwrp.EbpfFirewallRules
 		if r.domainFilter != nil {
-			domainRules, splitIPRules := fwrp.SplitDomainAndIPRules(egressRules)
-			r.domainFilter.SetRules(podIdentifier, filter.ClusterPolicyEndpointSource, domainRules)
+			var splitIPRules []fwrp.EbpfFirewallRules
+			domainRules, splitIPRules = fwrp.SplitDomainAndIPRules(egressRules)
 			ipEgressRules = splitIPRules
-		}
-		if r.proxyManager != nil {
-			if err := r.proxyManager.SyncPod(targetPod, podIdentifier); err != nil {
+			if err := disableDNSPolicyForPods(
+				r.domainFilter,
+				r.proxyManager,
+				filter.ClusterPolicyEndpointSource,
+				podIdentifier,
+				[]npatypes.Pod{targetPod},
+			); err != nil {
 				return err
 			}
 		}
 		if err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, ipEgressRules); err != nil {
 			log().Errorf("cluster policy map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
+			return err
+		}
+		if err := syncDNSPolicyForPods(
+			r.domainFilter,
+			r.proxyManager,
+			filter.ClusterPolicyEndpointSource,
+			podIdentifier,
+			domainRules,
+			[]npatypes.Pod{targetPod},
+		); err != nil {
 			return err
 		}
 		return nil

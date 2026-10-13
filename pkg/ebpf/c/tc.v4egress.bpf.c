@@ -105,6 +105,7 @@ struct data_t {
 	__u8 tier;
 };
 
+#ifdef ENABLE_DNS_POLICY
 struct ipcache_value {
 	__u64 expiry_time;
 	struct lpm_cp_trie_val ports[MAX_PORT_PROTOCOL];
@@ -114,9 +115,10 @@ struct bpf_map_def_pvt SEC("maps") ipcache_map = {
 	.type = BPF_MAP_TYPE_LRU_HASH,
 	.key_size = sizeof(__u32),
 	.value_size = sizeof(struct ipcache_value),
-	.max_entries = 65536,
+	.max_entries = 1024,
 	.pinning = PIN_GLOBAL_NS,
 };
+#endif
 
 struct bpf_map_def_pvt SEC("maps") cp_egress_map = {
 	.type = BPF_MAP_TYPE_LPM_TRIE,
@@ -158,6 +160,7 @@ struct dns_cache_priority {
 	__u32 baseline;
 };
 
+#ifdef ENABLE_DNS_POLICY
 static __attribute__((noinline)) int checkIPCache(__u32 dest_ip, __u16 dest_port, __u8 protocol,
 						  struct dns_cache_priority *priority) {
 	priority->admin = MAX_RULE_PRIORITY;
@@ -193,6 +196,7 @@ static __attribute__((noinline)) int checkIPCache(__u32 dest_ip, __u16 dest_port
 	}
 	return action;
 }
+#endif
 
 static __attribute__((noinline)) int evaluateClusterPolicyByLookUp(struct keystruct *trie_key,
 							   struct conntrack_key *flow_key,
@@ -293,7 +297,11 @@ static __attribute__((noinline)) int evaluateFlow(struct keystruct *trie_key, st
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
 		__u32 baseline_tier_priority;
-		struct dns_cache_priority dns_priority;
+			struct dns_cache_priority dns_priority = {
+				.admin = MAX_RULE_PRIORITY,
+				.namespace = MAX_RULE_PRIORITY,
+				.baseline = MAX_RULE_PRIORITY,
+			};
 		int effective_action;
 
 		// 1. Lookup Cluster Network Policy
@@ -315,7 +323,10 @@ static __attribute__((noinline)) int evaluateFlow(struct keystruct *trie_key, st
 
 		
 		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
-		int ipcache_action = checkIPCache(flow_key->dest_ip, flow_key->dest_port, flow_key->protocol, &dns_priority);
+			int ipcache_action = ACTION_PASS;
+#ifdef ENABLE_DNS_POLICY
+			ipcache_action = checkIPCache(flow_key->dest_ip, flow_key->dest_port, flow_key->protocol, &dns_priority);
+#endif
 		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT ||
 		    dns_priority.admin <= ADMIN_TIER_PRIORITY_LIMIT) {
 			effective_action = admin_tier_action;

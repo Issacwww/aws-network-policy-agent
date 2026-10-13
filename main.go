@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
@@ -49,9 +50,7 @@ import (
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/config"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -124,7 +123,7 @@ func main() {
 		npMode, isMultiNICEnabled := lo.Must2(getNetworkPolicyConfigsFromIpamd(ctx, log))
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
-			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
+			ctrlConfig.EnableIPv6, ctrlConfig.EnableDNSPolicy, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
 		ebpfClient.ReAttachEbpfProbes()
 
 		var dnsDependencies []controllers.DNSPolicyDependencies
@@ -133,17 +132,9 @@ func main() {
 				log.Error("DNS policy is only supported for IPv4 in S1")
 				os.Exit(1)
 			}
-			kubeDNS := &corev1.Service{}
-			if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{
-				Name:      "kube-dns",
-				Namespace: "kube-system",
-			}, kubeDNS); err != nil {
+			upstream, err := kubeDNSUpstream(os.Getenv)
+			if err != nil {
 				log.Errorf("Failed to discover kube-dns Service: %v", err)
-				os.Exit(1)
-			}
-			upstreamIP, err := netip.ParseAddr(kubeDNS.Spec.ClusterIP)
-			if err != nil || !upstreamIP.Is4() {
-				log.Errorf("kube-dns Service has invalid IPv4 ClusterIP %q", kubeDNS.Spec.ClusterIP)
 				os.Exit(1)
 			}
 			domainFilter := filter.New()
@@ -151,7 +142,7 @@ func main() {
 				log,
 				domainFilter,
 				ebpfClient,
-				netip.AddrPortFrom(upstreamIP, 53),
+				upstream,
 			)
 			if err != nil {
 				log.Errorf("Failed to initialize DNS policy proxy: %v", err)
@@ -238,6 +229,15 @@ func main() {
 		os.Exit(1)
 	}
 
+}
+
+func kubeDNSUpstream(getenv func(string) string) (netip.AddrPort, error) {
+	rawIP := getenv("KUBE_DNS_SERVICE_HOST")
+	upstreamIP, err := netip.ParseAddr(rawIP)
+	if err != nil || !upstreamIP.Is4() {
+		return netip.AddrPort{}, fmt.Errorf("KUBE_DNS_SERVICE_HOST is not a valid IPv4 address: %q", rawIP)
+	}
+	return netip.AddrPortFrom(upstreamIP, 53), nil
 }
 
 // loadControllerConfig loads the controller configuration

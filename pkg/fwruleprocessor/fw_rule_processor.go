@@ -334,6 +334,11 @@ func (f *FirewallRuleProcessor) ComputeClusterPolicyMapEntriesFromEndpointRules(
 
 	// Step 2-3: Process each CIDR and handle overlaps
 	for _, rule := range firewallRules {
+		// Domain rules are handled by the DNS policy path when enabled. When the
+		// feature is disabled, ignore them here and preserve IP-only behavior.
+		if rule.IPCidr == "" {
+			continue
+		}
 
 		cidr := f.normalizeCIDR(string(rule.IPCidr))
 		if f.shouldSkipRule(cidr) {

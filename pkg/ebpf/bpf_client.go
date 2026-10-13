@@ -37,6 +37,7 @@ import (
 var (
 	TC_INGRESS_BINARY                                = "tc.v4ingress.bpf.o"
 	TC_EGRESS_BINARY                                 = "tc.v4egress.bpf.o"
+	TC_DNS_EGRESS_BINARY                             = "tc.v4egress.dns.bpf.o"
 	TC_V6_INGRESS_BINARY                             = "tc.v6ingress.bpf.o"
 	TC_V6_EGRESS_BINARY                              = "tc.v6egress.bpf.o"
 	EVENTS_BINARY                                    = "v4events.bpf.o"
@@ -147,7 +148,7 @@ type BPFContext struct {
 }
 
 func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs bool,
-	enableIPv6 bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string) (*bpfClient, error) {
+	enableIPv6, enableDNSPolicy bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string) (*bpfClient, error) {
 	var conntrackMap goebpfmaps.BpfMap
 
 	ebpfClient := &bpfClient{
@@ -168,12 +169,15 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		clusterPolicyEgressInMemoryMap:  new(sync.Map),
 		deletedPods:                     new(sync.Map),
 		enableIPv6:                      enableIPv6,
+		enableDNSPolicy:                 enableDNSPolicy,
 	}
 	ingressBinary, egressBinary, eventsBinary,
 		cliBinary, hostMask := TC_INGRESS_BINARY, TC_EGRESS_BINARY, EVENTS_BINARY, EKS_CLI_BINARY, IPv4_HOST_MASK
 	if enableIPv6 {
 		ingressBinary, egressBinary, eventsBinary,
 			cliBinary, hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, EKS_V6_CLI_BINARY, IPv6_HOST_MASK
+	} else if enableDNSPolicy {
+		egressBinary = TC_DNS_EGRESS_BINARY
 	}
 	ebpfClient.ingressBinary, ebpfClient.egressBinary,
 		ebpfClient.hostMask = ingressBinary, egressBinary, hostMask
@@ -369,6 +373,8 @@ type bpfClient struct {
 	deletedPods *sync.Map
 	// enableIPv6 disables the S1 IPv4-only DNS ipcache path in IPv6 mode.
 	enableIPv6 bool
+	// enableDNSPolicy selects the opt-in IPv4 egress binary that contains the DNS ipcache.
+	enableDNSPolicy bool
 }
 
 func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostBinaryPath string) (bool, bool, bool, error) {

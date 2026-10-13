@@ -115,29 +115,21 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 		NamespacedName: types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE},
 	}
 
-	var ingressRules, ipEgressRules []fwrp.EbpfFirewallRules
+	var ingressRules, egressRules, ipEgressRules []fwrp.EbpfFirewallRules
 	if policiesAvailableInLocalCache {
-		var egressRules []fwrp.EbpfFirewallRules
 		ingressRules, egressRules, err =
 			s.policyReconciler.DeriveFireWallRulesPerPodIdentifier(podIdentifier, in.K8S_POD_NAMESPACE)
 		if err != nil {
 			return nil, err
 		}
-		if err := s.policyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, egressRules); err != nil {
-			return nil, err
-		}
 		_, ipEgressRules = fwrp.SplitDomainAndIPRules(egressRules)
 	}
 
-	var clusterIngressRules, clusterIPEgressRules []fwrp.EbpfFirewallRules
+	var clusterIngressRules, clusterEgressRules, clusterIPEgressRules []fwrp.EbpfFirewallRules
 	if clusterPolicyAvailableInLocalCache {
-		var clusterEgressRules []fwrp.EbpfFirewallRules
 		clusterIngressRules, clusterEgressRules, err =
 			s.clusterPolicyReconciler.DeriveClusterPolicyFireWallRulesPerPodIdentifier(ctx, podIdentifier)
 		if err != nil {
-			return nil, err
-		}
-		if err := s.clusterPolicyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, clusterEgressRules); err != nil {
 			return nil, err
 		}
 		_, clusterIPEgressRules = fwrp.SplitDomainAndIPRules(clusterEgressRules)
@@ -202,6 +194,20 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 
 		} else {
 			log().Info("Pod shares the eBPF firewall maps with other local pods. No Map update required..")
+		}
+	}
+
+	// Publish DNS rules and install redirection only after the CIDR maps and pod
+	// state are ready. This prevents a DNS answer from authorizing traffic
+	// against stale higher-priority CIDR policy.
+	if policiesAvailableInLocalCache {
+		if err := s.policyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, egressRules); err != nil {
+			return nil, err
+		}
+	}
+	if clusterPolicyAvailableInLocalCache {
+		if err := s.clusterPolicyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, clusterEgressRules); err != nil {
+			return nil, err
 		}
 	}
 

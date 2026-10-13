@@ -486,16 +486,12 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 					log().Warnf("both CIDR and DomainName are empty in PE name %s, NS: %s", currentPE.Name, currentPE.Namespace)
 					continue
 				}
-				if endPointInfo.CIDR == "" {
-					log().Infof("CIDR is empty, skipping the egress rule %s, NS: %s", currentPE.Name, currentPE.Namespace)
-					continue
-				}
-
 				egressRules = append(egressRules,
 					fwrp.EbpfFirewallRules{
-						IPCidr: endPointInfo.CIDR,
-						Except: endPointInfo.Except,
-						L4Info: endPointInfo.Ports,
+						DomainName: string(endPointInfo.DomainName),
+						IPCidr:     endPointInfo.CIDR,
+						Except:     endPointInfo.Except,
+						L4Info:     endPointInfo.Ports,
 					})
 			}
 			log().Infof("Total no.of - ingressRules %d egressRules %d", len(ingressRules), len(egressRules))

@@ -1,14 +1,11 @@
 package dnsproxy
 
 import (
-	"errors"
 	"net/netip"
 	"time"
 
 	"github.com/aws/aws-network-policy-agent/pkg/filter"
 )
-
-var ErrNotImplemented = errors.New("DNS response planning is not implemented")
 
 type IPFamily uint8
 
@@ -60,28 +57,74 @@ type QueryForwarder interface {
 	Forward(string) (Response, error)
 }
 
-type Proxy struct{}
-
-func NewProxy(QueryForwarder, QueryMatcher, CacheWriter) *Proxy {
-	return &Proxy{}
+type Proxy struct {
+	forwarder QueryForwarder
+	matcher   QueryMatcher
+	writer    CacheWriter
 }
 
-func (p *Proxy) HandleApplicationQuery(string, IPFamily, time.Time) error {
-	return ErrNotImplemented
+func NewProxy(forwarder QueryForwarder, matcher QueryMatcher, writer CacheWriter) *Proxy {
+	return &Proxy{forwarder: forwarder, matcher: matcher, writer: writer}
 }
 
-func PlanCacheWrites(PlanRequest) ([]CacheWrite, error) {
-	return nil, ErrNotImplemented
+func (p *Proxy) HandleApplicationQuery(queryName string, family IPFamily, now time.Time) error {
+	response, err := p.forwarder.Forward(queryName)
+	if err != nil {
+		return err
+	}
+	return ProcessResponse(response, family, now, p.matcher, p.writer)
 }
 
-func ProcessResponse(Response, IPFamily, time.Time, QueryMatcher, CacheWriter) error {
-	return ErrNotImplemented
+func PlanCacheWrites(request PlanRequest) ([]CacheWrite, error) {
+	if !request.Matched {
+		return nil, nil
+	}
+	writes := make([]CacheWrite, 0, len(request.Response.Addresses))
+	for _, address := range request.Response.Addresses {
+		if request.Family == IPv4 && !address.IP.Is4() {
+			continue
+		}
+		if request.Family == IPv6 && !address.IP.Is6() {
+			continue
+		}
+		ttl := address.TTL
+		if ttl == 0 {
+			ttl = 300
+		}
+		writes = append(writes, CacheWrite{
+			QueryName: request.Response.QueryName,
+			IP:        address.IP,
+			ExpiresAt: request.Now.Add(time.Duration(ttl) * time.Second),
+			Rule:      request.Rule,
+		})
+	}
+	return writes, nil
 }
 
-func SelectUpstream(netip.AddrPort, bool) (RouteDecision, error) {
-	return RouteDecision{}, ErrNotImplemented
+func ProcessResponse(response Response, family IPFamily, now time.Time, matcher QueryMatcher, writer CacheWriter) error {
+	rule, matched := matcher.Match(response.QueryName)
+	writes, err := PlanCacheWrites(PlanRequest{
+		Response: response,
+		Matched:  matched,
+		Rule:     rule,
+		Family:   family,
+		Now:      now,
+	})
+	if err != nil {
+		return err
+	}
+	for _, write := range writes {
+		if err := writer.Write(write); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func AuthorizesNewConnection(CacheWrite, time.Time) bool {
-	return false
+func SelectUpstream(original netip.AddrPort, intercepted bool) (RouteDecision, error) {
+	return RouteDecision{Upstream: original, Bypass: !intercepted}, nil
+}
+
+func AuthorizesNewConnection(entry CacheWrite, now time.Time) bool {
+	return entry.ExpiresAt.After(now)
 }

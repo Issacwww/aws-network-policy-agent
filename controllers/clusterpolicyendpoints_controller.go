@@ -355,11 +355,6 @@ func (r *ClusterPolicyEndpointsReconciler) deriveClusterPolicyIngressAndEgressFi
 					continue
 				}
 
-				if endPointInfo.CIDR == "" {
-					log().Infof("CIDR is empty, skipping the egress rule %s", currentCPE.Name)
-					continue
-				}
-
 				priority := int(currentCPE.Spec.Priority)
 				if currentCPE.Spec.Tier == policyk8sawsv1.BaselineTier {
 					priority += fwrp.BASELINE_TIER_PRIORITY_OFFSET

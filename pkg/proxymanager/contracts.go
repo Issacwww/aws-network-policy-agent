@@ -1,9 +1,5 @@
 package proxymanager
 
-import "errors"
-
-var ErrNotImplemented = errors.New("DNS proxy manager is not implemented")
-
 type SyncInput struct {
 	FeatureEnabled bool
 	PodIdentifier  string
@@ -24,6 +20,16 @@ type RedirectRuleManager interface {
 	Add(RedirectRequest) error
 }
 
-func SyncPod(SyncInput, DomainRuleStore, RedirectRuleManager) error {
-	return ErrNotImplemented
+func SyncPod(input SyncInput, rules DomainRuleStore, redirects RedirectRuleManager) error {
+	if !input.FeatureEnabled {
+		return nil
+	}
+	if !rules.HasAnyDomainRules(input.PodIdentifier) {
+		return nil
+	}
+	return redirects.Add(RedirectRequest{
+		HostVeth:                    input.HostVeth,
+		PreserveOriginalDestination: true,
+		HookPriority:                -110,
+	})
 }

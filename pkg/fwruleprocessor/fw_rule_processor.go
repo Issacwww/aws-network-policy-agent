@@ -32,6 +32,25 @@ type EbpfFirewallRules struct {
 	L4Info     []v1alpha1.Port
 }
 
+func SplitDomainAndIPRules(rules []EbpfFirewallRules) ([]EbpfFirewallRules, []EbpfFirewallRules) {
+	domainRules := make([]EbpfFirewallRules, 0, len(rules))
+	ipRules := make([]EbpfFirewallRules, 0, len(rules))
+	for _, rule := range rules {
+		if rule.DomainName != "" {
+			domainRule := rule
+			domainRule.IPCidr = ""
+			domainRule.Except = nil
+			domainRules = append(domainRules, domainRule)
+		}
+		if rule.IPCidr != "" {
+			ipRule := rule
+			ipRule.DomainName = ""
+			ipRules = append(ipRules, ipRule)
+		}
+	}
+	return domainRules, ipRules
+}
+
 type FirewallRuleProcessor struct {
 	// Primary IP of the node
 	nodeIP   string

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	// "unsafe"
@@ -392,6 +394,26 @@ func TestCheckAndUpdateBPFBinaries(t *testing.T) {
 			assert.Equal(t, tt.wantErr, gotError)
 		})
 	}
+}
+
+func TestIsEgressBPFProbeIncludesDNSBinary(t *testing.T) {
+	assert.True(t, isEgressBPFProbe(TC_EGRESS_BINARY))
+	assert.True(t, isEgressBPFProbe(TC_DNS_EGRESS_BINARY))
+	assert.True(t, isEgressBPFProbe(TC_V6_EGRESS_BINARY))
+	assert.False(t, isEgressBPFProbe(TC_INGRESS_BINARY))
+}
+
+func TestActivateDNSEgressBinaryUsesCanonicalDestination(t *testing.T) {
+	tempDir := t.TempDir()
+	source := filepath.Join(tempDir, "dns.o")
+	destination := filepath.Join(tempDir, "egress.o")
+	require.NoError(t, os.WriteFile(source, []byte("dns-enabled"), 0o644))
+	require.NoError(t, os.WriteFile(destination, []byte("standard"), 0o644))
+
+	require.NoError(t, activateDNSEgressBinary(source, destination))
+	got, err := os.ReadFile(destination)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("dns-enabled"), got)
 }
 
 func TestBpfClient_AttacheBPFProbes(t *testing.T) {

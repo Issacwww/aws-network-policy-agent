@@ -177,7 +177,9 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		ingressBinary, egressBinary, eventsBinary,
 			cliBinary, hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, EKS_V6_CLI_BINARY, IPv6_HOST_MASK
 	} else if enableDNSPolicy {
-		egressBinary = TC_DNS_EGRESS_BINARY
+		if err := activateDNSEgressBinary(TC_DNS_EGRESS_BINARY, TC_EGRESS_BINARY); err != nil {
+			return nil, fmt.Errorf("activate DNS egress binary: %w", err)
+		}
 	}
 	ebpfClient.ingressBinary, ebpfClient.egressBinary,
 		ebpfClient.hostMask = ingressBinary, egressBinary, hostMask
@@ -413,13 +415,27 @@ func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostB
 				log().Info("change detected in ingress probe binaries.. ")
 				updateIngressProbe = true
 			}
-			if bpfProbe == TC_EGRESS_BINARY || bpfProbe == TC_V6_EGRESS_BINARY {
+			if isEgressBPFProbe(bpfProbe) {
 				log().Info("change detected in egress probe binaries..")
 				updateEgressProbe = true
 			}
 		}
 	}
 	return updateIngressProbe, updateEgressProbe, updateEventsProbe, nil
+}
+
+func isEgressBPFProbe(binary string) bool {
+	return binary == TC_EGRESS_BINARY ||
+		binary == TC_DNS_EGRESS_BINARY ||
+		binary == TC_V6_EGRESS_BINARY
+}
+
+func activateDNSEgressBinary(source, destination string) error {
+	dnsBinary, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(destination, dnsBinary, 0o644)
 }
 
 func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.BpfSDKClient, policyEndpointeBPFContext *sync.Map, globalMaps *sync.Map, updateIngressProbe,

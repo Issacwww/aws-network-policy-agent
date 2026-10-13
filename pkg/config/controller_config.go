@@ -50,6 +50,8 @@ type ControllerConfig struct {
 	EnableIPv6 bool
 	// Enable Network Policy
 	EnableNetworkPolicy bool
+	// Enable DNS Policy
+	EnableDNSPolicy bool
 	// ConntrackCacheCleanupPeriod specifies the cleanup period
 	ConntrackCacheCleanupPeriod int
 	// ConntrackTableSize specifies the conntrack table size for the agent

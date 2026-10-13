@@ -109,6 +109,13 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	for _, firewallRule := range firewallRules {
 		var cidrL4Info []v1alpha1.Port
 
+		// Domain rules are handled by the DNS policy path when that feature is
+		// enabled. Ignore them here so feature-disabled agents preserve their
+		// existing IP-only behavior.
+		if firewallRule.IPCidr == "" {
+			continue
+		}
+
 		if !strings.Contains(string(firewallRule.IPCidr), "/") {
 			firewallRule.IPCidr += v1alpha1.NetworkAddress(f.hostMask)
 		}

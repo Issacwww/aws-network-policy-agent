@@ -25,7 +25,9 @@ import (
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
+	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
@@ -62,12 +64,21 @@ func clusterPolicyPrometheusRegister() {
 }
 
 // NewClusterPolicyEndpointsReconciler constructs new ClusterPolicyEndpointReconciler
-func NewClusterPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient) *ClusterPolicyEndpointsReconciler {
+func NewClusterPolicyEndpointsReconciler(
+	k8sClient client.Client,
+	nodeIP string,
+	ebpfClient ebpf.BpfClient,
+	dnsDependencies ...DNSPolicyDependencies,
+) *ClusterPolicyEndpointsReconciler {
 	r := &ClusterPolicyEndpointsReconciler{
 		k8sClient:        k8sClient,
 		nodeIP:           nodeIP,
 		ebpfClient:       ebpfClient,
 		trackerStartTime: time.Now(),
+	}
+	if len(dnsDependencies) > 0 {
+		r.domainFilter = dnsDependencies[0].Filter
+		r.proxyManager = dnsDependencies[0].Proxy
 	}
 	clusterPolicyPrometheusRegister()
 	return r
@@ -95,7 +106,9 @@ type ClusterPolicyEndpointsReconciler struct {
 	// Maps ClusterNetworkPolicy to list of selected pod Identifiers
 	clusterNetworkPolicyToPodIdentifierMap sync.Map
 
-	ebpfClient ebpf.BpfClient
+	ebpfClient   ebpf.BpfClient
+	domainFilter filter.Store
+	proxyManager proxymanager.ProxyManager
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=clusterpolicyendpoints,verbs=get;list;watch
@@ -192,6 +205,7 @@ func (r *ClusterPolicyEndpointsReconciler) reconcileClusterPolicyEndpoint(ctx co
 	r.commitClusterPolicyEndpointState(resourceName, targetPods, targetPodIdentifiers, parentCPEList)
 
 	programmingSucceeded := true
+	var configureErr error
 	for podIdentifier := range targetPodIdentifiers {
 		ingressRules, egressRules, err := r.deriveClusterPolicyIngressAndEgressFirewallRules(ctx, podIdentifier, ClusterPolicyEndpoint.Name, false)
 		if err != nil {
@@ -201,12 +215,13 @@ func (r *ClusterPolicyEndpointsReconciler) reconcileClusterPolicyEndpoint(ctx co
 		if err := r.configureClusterPolicyBPFProbes(podIdentifier, targetPods, ingressRules, egressRules); err != nil {
 			log().Errorf("Error configuring Cluster Policy eBPF Probes %v", err)
 			programmingSucceeded = false
+			configureErr = errors.Join(configureErr, err)
 		}
 	}
 
 	r.observeClusterPolicyProgrammingLatency(ClusterPolicyEndpoint, programmingSucceeded)
 
-	return nil
+	return configureErr
 }
 
 // observeClusterPolicyProgrammingLatency emits the E2E latency histogram from
@@ -250,6 +265,12 @@ func (r *ClusterPolicyEndpointsReconciler) observeClusterPolicyProgrammingLatenc
 }
 
 func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podIdentifier string, targetPods []npatypes.Pod, ingressRules, egressRules []fwrp.EbpfFirewallRules) error {
+	ipEgressRules := egressRules
+	if r.domainFilter != nil {
+		domainRules, splitIPRules := fwrp.SplitDomainAndIPRules(egressRules)
+		r.domainFilter.SetRules(podIdentifier, filter.ClusterPolicyEndpointSource, domainRules)
+		ipEgressRules = splitIPRules
+	}
 
 	for _, pod := range targetPods {
 		currentPodIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
@@ -263,9 +284,14 @@ func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podId
 			return err
 		}
 		log().Infof("Successfully attached required eBPF probes for pod: %s in namespace %s", pod.Name, pod.Namespace)
+		if r.proxyManager != nil {
+			if err := r.proxyManager.SyncPod(pod, podIdentifier); err != nil {
+				return err
+			}
+		}
 	}
 
-	err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, egressRules)
+	err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, ipEgressRules)
 	if err != nil {
 		log().Errorf("cluster policy Map updates failed for podIdentifier %s: %v", podIdentifier, err)
 		return err
@@ -466,13 +492,32 @@ func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.C
 			log().Errorf("Error Parsing cluster policy Endpoint resource %s: %v", clusterPolicyEndpoint, err)
 			return err
 		}
-		if err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, egressRules); err != nil {
+		ipEgressRules := egressRules
+		if r.domainFilter != nil {
+			domainRules, splitIPRules := fwrp.SplitDomainAndIPRules(egressRules)
+			r.domainFilter.SetRules(podIdentifier, filter.ClusterPolicyEndpointSource, domainRules)
+			ipEgressRules = splitIPRules
+		}
+		if r.proxyManager != nil {
+			if err := r.proxyManager.SyncPod(targetPod, podIdentifier); err != nil {
+				return err
+			}
+		}
+		if err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, ipEgressRules); err != nil {
 			log().Errorf("cluster policy map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
 			return err
 		}
 		return nil
 	}
 
+	if r.domainFilter != nil {
+		r.domainFilter.DeleteRules(podIdentifier, filter.ClusterPolicyEndpointSource)
+	}
+	if r.proxyManager != nil {
+		if err := r.proxyManager.SyncPod(targetPod, podIdentifier); err != nil {
+			return err
+		}
+	}
 	// Nothing selects this identifier anymore; clear its eBPF maps. Skip if probes
 	// were already detached — UpdateClusterPolicyEbpfMaps would fail without context.
 	if !r.ebpfClient.HasBPFContext(podIdentifier) {

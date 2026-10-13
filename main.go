@@ -21,11 +21,14 @@ import (
 	"errors"
 	"net/http"
 	_ "net/http/pprof"
+	"net/netip"
 	"os"
 	"time"
 
 	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/filter"
+	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
 	"github.com/aws/aws-network-policy-agent/pkg/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/rpcclient"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
@@ -46,7 +49,9 @@ import (
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/config"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -122,14 +127,55 @@ func main() {
 			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
 		ebpfClient.ReAttachEbpfProbes()
 
-		policyEndpointController = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6)
+		var dnsDependencies []controllers.DNSPolicyDependencies
+		if ctrlConfig.EnableDNSPolicy {
+			if ctrlConfig.EnableIPv6 {
+				log.Error("DNS policy is only supported for IPv4 in S1")
+				os.Exit(1)
+			}
+			kubeDNS := &corev1.Service{}
+			if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{
+				Name:      "kube-dns",
+				Namespace: "kube-system",
+			}, kubeDNS); err != nil {
+				log.Errorf("Failed to discover kube-dns Service: %v", err)
+				os.Exit(1)
+			}
+			upstreamIP, err := netip.ParseAddr(kubeDNS.Spec.ClusterIP)
+			if err != nil || !upstreamIP.Is4() {
+				log.Errorf("kube-dns Service has invalid IPv4 ClusterIP %q", kubeDNS.Spec.ClusterIP)
+				os.Exit(1)
+			}
+			domainFilter := filter.New()
+			proxyManager, err := proxymanager.New(
+				log,
+				domainFilter,
+				ebpfClient,
+				netip.AddrPortFrom(upstreamIP, 53),
+			)
+			if err != nil {
+				log.Errorf("Failed to initialize DNS policy proxy: %v", err)
+				os.Exit(1)
+			}
+			defer proxyManager.Stop()
+			dnsDependencies = append(dnsDependencies, controllers.DNSPolicyDependencies{
+				Filter: domainFilter,
+				Proxy:  proxyManager,
+			})
+		}
+
+		policyEndpointController = controllers.NewPolicyEndpointsReconciler(
+			mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6, dnsDependencies...,
+		)
 
 		if err = policyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller PolicyEndpoints %v", err)
 			os.Exit(1)
 		}
 
-		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient)
+		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(
+			mgr.GetClient(), nodeIP, ebpfClient, dnsDependencies...,
+		)
 		if err = clusterPolicyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller ClusterPolicyEndpoints %v", err)
 			os.Exit(1)

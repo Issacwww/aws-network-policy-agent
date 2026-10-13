@@ -58,9 +58,12 @@ import (
 )
 
 var (
-	scheme              = runtime.NewScheme()
-	LOCAL_IPAMD_ADDRESS = "unix:///var/run/aws-node/ipamd.sock"
-	npaSocketPath       = "/var/run/aws-node/npa.sock"
+	scheme                       = runtime.NewScheme()
+	LOCAL_IPAMD_ADDRESS          = "unix:///var/run/aws-node/ipamd.sock"
+	LOCAL_IPAMD_FALLBACK_ADDRESS = "127.0.0.1:50051"
+	localIPAMDAddresses          = []string{LOCAL_IPAMD_ADDRESS, LOCAL_IPAMD_FALLBACK_ADDRESS}
+	localIPAMDAttemptTimeout     = 2 * time.Second
+	npaSocketPath                = "/var/run/aws-node/npa.sock"
 )
 
 func init() {
@@ -254,27 +257,73 @@ func loadControllerConfig() (config.ControllerConfig, error) {
 }
 
 func getNetworkPolicyConfigsFromIpamd(ctx context.Context, log logger.Logger) (string, bool, error) {
-	log.Infof("Trying to establish GRPC connection to ipamd at %s", LOCAL_IPAMD_ADDRESS)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	grpcConn, err := rpcclient.New().Dial(ctx, LOCAL_IPAMD_ADDRESS, rpcclient.GetDefaultServiceRetryConfig(), rpcclient.GetInsecureConnectionType())
-	if err != nil {
-		log.Errorf("Failed to connect to ipamd at %s: %v", LOCAL_IPAMD_ADDRESS, err)
-		return "", false, err
-	}
-	defer grpcConn.Close()
 
-	ipamd := cnirpc.NewConfigServerBackendClient(grpcConn)
-	resp, err := ipamd.GetNetworkPolicyConfigs(ctx, &emptypb.Empty{})
-	if err != nil {
-		log.Errorf("Failed to get network policy configs %v", err)
-		return "", false, err
+	return getNetworkPolicyConfigsFromAddresses(
+		ctx,
+		localIPAMDAddresses,
+		localIPAMDAttemptTimeout,
+		func(attemptCtx context.Context, address string) (string, bool, error) {
+			log.Infof("Trying to establish GRPC connection to ipamd at %s", address)
+			grpcConn, err := rpcclient.New().Dial(
+				attemptCtx,
+				address,
+				rpcclient.GetDefaultServiceRetryConfig(),
+				rpcclient.GetInsecureConnectionType(),
+			)
+			if err != nil {
+				return "", false, err
+			}
+			defer grpcConn.Close()
+
+			ipamd := cnirpc.NewConfigServerBackendClient(grpcConn)
+			resp, err := ipamd.GetNetworkPolicyConfigs(attemptCtx, &emptypb.Empty{})
+			if err != nil {
+				return "", false, err
+			}
+			if !utils.IsValidNetworkPolicyEnforcingMode(resp.NetworkPolicyMode) {
+				return "", false, errors.New("invalid Network Policy Mode")
+			}
+			log.Infof(
+				"Connected to ipamd at %s. NetworkPolicyMode: %s MultiNICEnabled: %v",
+				address,
+				resp.NetworkPolicyMode,
+				resp.MultiNICEnabled,
+			)
+			return resp.NetworkPolicyMode, resp.MultiNICEnabled, nil
+		},
+	)
+}
+
+func getNetworkPolicyConfigsFromAddresses(
+	ctx context.Context,
+	addresses []string,
+	attemptTimeout time.Duration,
+	fetch func(context.Context, string) (string, bool, error),
+) (string, bool, error) {
+	if len(addresses) == 0 {
+		return "", false, errors.New("no ipamd addresses configured")
 	}
-	log.Infof("Connected to ipamd at %s. NetworkPolicyMode: %s MultiNICEnabled: %v", LOCAL_IPAMD_ADDRESS, resp.NetworkPolicyMode, resp.MultiNICEnabled)
-	if !utils.IsValidNetworkPolicyEnforcingMode(resp.NetworkPolicyMode) {
-		err = errors.New("Invalid Network Policy Mode")
-		log.Errorf("Invalid Network Policy Mode from ipamd %s error: %v", resp.NetworkPolicyMode, err)
-		return "", false, err
+
+	var lastErr error
+	for ctx.Err() == nil {
+		for _, address := range addresses {
+			attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+			networkPolicyMode, multiNICEnabled, err := fetch(attemptCtx, address)
+			cancel()
+			if err == nil {
+				return networkPolicyMode, multiNICEnabled, nil
+			}
+			lastErr = fmt.Errorf("ipamd at %s: %w", address, err)
+			if ctx.Err() != nil {
+				break
+			}
+		}
 	}
-	return resp.NetworkPolicyMode, resp.MultiNICEnabled, nil
+
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return "", false, fmt.Errorf("failed to get network policy configs: %w", lastErr)
 }

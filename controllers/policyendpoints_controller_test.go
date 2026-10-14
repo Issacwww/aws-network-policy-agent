@@ -375,7 +375,8 @@ func TestDeriveIngressAndEgressFirewallRules(t *testing.T) {
 				},
 				egressRules: []fwrp.EbpfFirewallRules{
 					{
-						IPCidr: "2.2.2.2/32",
+						Priority: 15001,
+						IPCidr:   "2.2.2.2/32",
 						L4Info: []policyendpoint.Port{
 							{
 								Protocol: &protocolUDP,
@@ -439,7 +440,8 @@ func TestDeriveIngressAndEgressFirewallRules(t *testing.T) {
 			want: want{
 				egressRules: []fwrp.EbpfFirewallRules{
 					{
-						IPCidr: "2.2.2.2/32",
+						Priority: 15001,
+						IPCidr:   "2.2.2.2/32",
 						L4Info: []policyendpoint.Port{
 							{
 								Protocol: &protocolUDP,
@@ -1160,7 +1162,8 @@ func TestDeriveFireWallRulesPerPodIdentifier(t *testing.T) {
 				},
 				egressRules: []fwrp.EbpfFirewallRules{
 					{
-						IPCidr: "2.2.2.2/32",
+						Priority: 15001,
+						IPCidr:   "2.2.2.2/32",
 						L4Info: []policyendpoint.Port{
 							{
 								Protocol: &protocolUDP,
@@ -1223,7 +1226,8 @@ func TestDeriveFireWallRulesPerPodIdentifier(t *testing.T) {
 			want: want{
 				egressRules: []fwrp.EbpfFirewallRules{
 					{
-						IPCidr: "2.2.2.2/32",
+						Priority: 15001,
+						IPCidr:   "2.2.2.2/32",
 						L4Info: []policyendpoint.Port{
 							{
 								Protocol: &protocolUDP,

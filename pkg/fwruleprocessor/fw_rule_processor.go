@@ -33,19 +33,22 @@ type EbpfFirewallRules struct {
 }
 
 func SplitDomainAndIPRules(rules []EbpfFirewallRules) ([]EbpfFirewallRules, []EbpfFirewallRules) {
+	return SegregateDomainAndIPRules(rules)
+}
+
+// SegregateDomainAndIPRules separates egress rules into domain and IP rules.
+// Auto mode normalizes domain names only by adding the DNS root label.
+func SegregateDomainAndIPRules(rules []EbpfFirewallRules) ([]EbpfFirewallRules, []EbpfFirewallRules) {
 	domainRules := make([]EbpfFirewallRules, 0, len(rules))
 	ipRules := make([]EbpfFirewallRules, 0, len(rules))
 	for _, rule := range rules {
 		if rule.DomainName != "" {
-			domainRule := rule
-			domainRule.IPCidr = ""
-			domainRule.Except = nil
-			domainRules = append(domainRules, domainRule)
-		}
-		if rule.IPCidr != "" {
-			ipRule := rule
-			ipRule.DomainName = ""
-			ipRules = append(ipRules, ipRule)
+			if !strings.HasSuffix(rule.DomainName, ".") {
+				rule.DomainName += "."
+			}
+			domainRules = append(domainRules, rule)
+		} else {
+			ipRules = append(ipRules, rule)
 		}
 	}
 	return domainRules, ipRules

@@ -22,7 +22,10 @@ import (
 	"github.com/aws/amazon-vpc-cni-k8s/rpc"
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
+	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestRunRPCHandler_NoExistingSocket(t *testing.T) {
@@ -213,3 +216,42 @@ func TestEnforceNpToPod_FailsClosedOnPodStateError(t *testing.T) {
 	assert.ErrorIs(t, err, injected)
 	assert.Nil(t, resp, "rpc must not return a success reply when the pod-state write fails")
 }
+
+func TestDeletePodNpDeletesBPFBeforeDNSCleanup(t *testing.T) {
+	mockBpfClient := &ebpf.MockBpfClient{}
+	proxy := &deleteOrderingProxy{bpfClient: mockBpfClient}
+	reconciler := controllers.NewPolicyEndpointsReconciler(
+		nil,
+		"10.0.0.1",
+		mockBpfClient,
+		false,
+		controllers.DNSPolicyDependencies{Proxy: proxy},
+	)
+	s := &server{policyReconciler: reconciler}
+
+	response, err := s.DeletePodNp(context.Background(), &rpc.DeleteNpRequest{
+		K8S_POD_NAME:      "nginx-abc123",
+		K8S_POD_NAMESPACE: "default",
+	})
+	assert.NoError(t, err)
+	assert.True(t, response.Success)
+	assert.True(t, proxy.bpfDeletedBeforeDNS, "Auto deletes BPF and marks the pod deleted before DNS cleanup")
+}
+
+type deleteOrderingProxy struct {
+	bpfClient           *ebpf.MockBpfClient
+	bpfDeletedBeforeDNS bool
+}
+
+func (*deleteOrderingProxy) SyncPod(npatypes.Pod, string) error { return nil }
+
+func (p *deleteOrderingProxy) RemovePod(types.NamespacedName) error {
+	p.bpfDeletedBeforeDNS = len(p.bpfClient.CallLog) > 0 &&
+		p.bpfClient.CallLog[len(p.bpfClient.CallLog)-1] == "DeleteBPFProbes"
+	return nil
+}
+
+func (*deleteOrderingProxy) HealthCheckDNSProxy() error { return nil }
+func (*deleteOrderingProxy) Stop() error                { return nil }
+
+var _ proxymanager.ProxyManager = (*deleteOrderingProxy)(nil)

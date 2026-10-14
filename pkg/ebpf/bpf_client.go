@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/utils/cp"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -64,6 +65,8 @@ var (
 	IPAM_JSON_PATH                                   = "/var/run/aws-node/ipam.json"
 	deletedPodsMinAge                                = 5 * time.Minute
 )
+
+var ErrPodDeleted = errors.New("pod has been deleted")
 
 func log() logger.Logger {
 	return logger.Get()
@@ -139,6 +142,7 @@ type BpfClient interface {
 	CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key int, state int) error
 	ClearDeletedPod(podNamespacedName string)
 	HasBPFContext(podIdentifier string) bool
+	WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, rules []npatypes.L4Rule) error
 }
 
 type BPFContext struct {
@@ -783,7 +787,7 @@ func EncodeIPCacheEntry(ip net.IP, expiryTime uint64, l4Rules []npatypes.L4Rule)
 		}
 
 		binary.LittleEndian.PutUint32(value.Ports[offset:offset+4], uint32(protocol))
-		binary.LittleEndian.PutUint32(value.Ports[offset+4:offset+8], uint32(rule.Priority*10+int(utils.ActionAccept)))
+		binary.LittleEndian.PutUint32(value.Ports[offset+4:offset+8], uint32(rule.Priority))
 		binary.LittleEndian.PutUint32(value.Ports[offset+8:offset+12], startPort)
 		binary.LittleEndian.PutUint32(value.Ports[offset+12:offset+16], endPort)
 	}
@@ -791,10 +795,6 @@ func EncodeIPCacheEntry(ip net.IP, expiryTime uint64, l4Rules []npatypes.L4Rule)
 }
 
 func (l *bpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error {
-	if l.enableIPv6 {
-		return errors.New("DNS ipcache is not supported for IPv6")
-	}
-
 	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
 	podIdentifierLock := value.(*sync.Mutex)
 	podIdentifierLock.Lock()
@@ -813,32 +813,47 @@ func (l *bpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTT
 		return fmt.Errorf("no %s registered for pod %s", utils.TC_IPCACHE_MAP, podIdentifier)
 	}
 
-	nowNs, err := utils.KtimeGetNs()
+	nowNs, err := ktimeBootNs()
 	if err != nil {
-		return fmt.Errorf("get monotonic time: %w", err)
+		return fmt.Errorf("get boot time: %w", err)
 	}
+	l4RulesBytes := utils.ComputeValueForL4Rules(l4Rules)
 	for _, ipWithTTL := range ips {
-		ttl := ipWithTTL.TTL
-		if ttl == 0 {
-			ttl = 300
+		mapValue := npatypes.IPCacheVal{
+			ExpiryTime: nowNs + uint64(ipWithTTL.TTL)*uint64(time.Second),
+			Ports:      [npatypes.L4RULE_VALUES_LENGTH]byte(l4RulesBytes),
 		}
-		key, mapValue, err := EncodeIPCacheEntry(
-			ipWithTTL.IP,
-			nowNs+uint64(ttl)*uint64(time.Second),
-			l4Rules,
-		)
-		if err != nil {
-			return err
+
+		var keyPtr uintptr
+		if l.enableIPv6 {
+			ipv6 := ipWithTTL.IP.To16()
+			if ipv6 == nil {
+				continue
+			}
+			var key [16]byte
+			copy(key[:], ipv6)
+			keyPtr = uintptr(unsafe.Pointer(&key))
+		} else {
+			ipv4 := ipWithTTL.IP.To4()
+			if ipv4 == nil {
+				continue
+			}
+			key := binary.LittleEndian.Uint32(ipv4)
+			keyPtr = uintptr(unsafe.Pointer(&key))
 		}
-		if err := ipcacheMap.CreateUpdateMapEntry(
-			uintptr(unsafe.Pointer(&key)),
-			uintptr(unsafe.Pointer(&mapValue)),
-			0,
-		); err != nil {
+		if err := ipcacheMap.CreateUpdateMapEntry(keyPtr, uintptr(unsafe.Pointer(&mapValue)), 0); err != nil {
 			return fmt.Errorf("write IP %s to %s: %w", ipWithTTL.IP, utils.TC_IPCACHE_MAP, err)
 		}
 	}
 	return nil
+}
+
+func ktimeBootNs() (uint64, error) {
+	var timestamp unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &timestamp); err != nil {
+		return 0, err
+	}
+	return uint64(timestamp.Sec)*uint64(time.Second) + uint64(timestamp.Nsec), nil
 }
 
 func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {
@@ -849,7 +864,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 
 	if _, deleted := l.deletedPods.Load(podNamespacedName); deleted {
 		log().Debugf("ignoring attaching ebpf probe to pod %s in namespace %s with pod identifier %s as it is already deleted", pod.Name, pod.Namespace, podIdentifier)
-		return nil
+		return ErrPodDeleted
 	}
 
 	// Two go routines can try to attach the probes at the same time

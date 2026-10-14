@@ -106,6 +106,10 @@ struct data_t {
 };
 
 #ifdef ENABLE_DNS_POLICY
+struct ipcache_key {
+	__u32 ip;
+};
+
 struct ipcache_value {
 	__u64 expiry_time;
 	struct lpm_cp_trie_val ports[MAX_PORT_PROTOCOL];
@@ -113,9 +117,9 @@ struct ipcache_value {
 
 struct bpf_map_def_pvt SEC("maps") ipcache_map = {
 	.type = BPF_MAP_TYPE_LRU_HASH,
-	.key_size = sizeof(__u32),
+	.key_size = sizeof(struct ipcache_key),
 	.value_size = sizeof(struct ipcache_value),
-	.max_entries = 1024,
+	.max_entries = 65536,
 	.pinning = PIN_GLOBAL_NS,
 };
 #endif
@@ -163,12 +167,13 @@ struct dns_cache_priority {
 #ifdef ENABLE_DNS_POLICY
 static __attribute__((noinline)) int checkIPCache(__u32 dest_ip, __u16 dest_port, __u8 protocol,
 						  struct dns_cache_priority *priority) {
+	struct ipcache_key cache_key = {.ip = dest_ip};
 	priority->admin = MAX_RULE_PRIORITY;
 	priority->namespace = MAX_RULE_PRIORITY;
 	priority->baseline = MAX_RULE_PRIORITY;
 
-	struct ipcache_value *cache_value = bpf_map_lookup_elem(&ipcache_map, &dest_ip);
-	if (cache_value == NULL || cache_value->expiry_time <= bpf_ktime_get_ns()) {
+	struct ipcache_value *cache_value = bpf_map_lookup_elem(&ipcache_map, &cache_key);
+	if (cache_value == NULL || cache_value->expiry_time < bpf_ktime_get_ns()) {
 		return ACTION_PASS;
 	}
 
@@ -183,12 +188,14 @@ static __attribute__((noinline)) int checkIPCache(__u32 dest_ip, __u16 dest_port
 		    (entry->start_port == ANY_PORT || dest_port == entry->start_port ||
 		     (entry->end_port > 0 && dest_port >= entry->start_port && dest_port <= entry->end_port))) {
 			__u32 encoded_priority = entry->priority / 10;
-			if (encoded_priority <= ADMIN_TIER_PRIORITY_LIMIT && encoded_priority < priority->admin) {
+			if (encoded_priority < priority->admin) {
 				priority->admin = encoded_priority;
-			} else if (encoded_priority == NETWORK_POLICY_TIER_PRIORITY) {
+			}
+			if (encoded_priority == NETWORK_POLICY_TIER_PRIORITY) {
 				priority->namespace = encoded_priority;
-			} else if (encoded_priority > NETWORK_POLICY_TIER_PRIORITY &&
-				   encoded_priority < priority->baseline) {
+			}
+			if (encoded_priority > NETWORK_POLICY_TIER_PRIORITY &&
+			    encoded_priority < priority->baseline) {
 				priority->baseline = encoded_priority;
 			}
 			action = ACTION_ALLOW;

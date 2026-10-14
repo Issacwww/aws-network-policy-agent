@@ -22,7 +22,6 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
-	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 
 	"github.com/aws/amazon-vpc-cni-k8s/rpc"
@@ -111,9 +110,6 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 	// the eBPF firewall maps with the newly launched pod, if already present we can skip the map update and return
 	policiesAvailableInLocalCache := s.policyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
 	clusterPolicyAvailableInLocalCache := s.clusterPolicyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
-	pod := npatypes.Pod{
-		NamespacedName: types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE},
-	}
 
 	var ingressRules, egressRules, ipEgressRules []fwrp.EbpfFirewallRules
 	if policiesAvailableInLocalCache {
@@ -197,20 +193,6 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 		}
 	}
 
-	// Publish DNS rules and install redirection only after the CIDR maps and pod
-	// state are ready. This prevents a DNS answer from authorizing traffic
-	// against stale higher-priority CIDR policy.
-	if policiesAvailableInLocalCache {
-		if err := s.policyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, egressRules); err != nil {
-			return nil, err
-		}
-	}
-	if clusterPolicyAvailableInLocalCache {
-		if err := s.clusterPolicyReconciler.SyncDNSPolicyForPod(pod, podIdentifier, clusterEgressRules); err != nil {
-			return nil, err
-		}
-	}
-
 	resp := rpc.EnforceNpReply{
 		Success: err == nil,
 	}
@@ -232,14 +214,14 @@ func (s *server) DeletePodNp(ctx context.Context, in *rpc.DeleteNpRequest) (*rpc
 	podIdentifier := utils.GetPodIdentifier(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
 	pod := types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE}
 
-	if err := s.policyReconciler.RemoveDNSPolicyForPod(pod); err != nil {
-		log().Errorf("Failed to delete DNS redirection for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
-		return &rpc.DeleteNpReply{Success: false}, err
-	}
-
 	err := s.policyReconciler.GeteBPFClient().DeleteBPFProbes(pod, podIdentifier)
 	if err != nil {
 		log().Errorf("Failed to delete BPF probes for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
+		return &rpc.DeleteNpReply{Success: false}, err
+	}
+
+	if err := s.policyReconciler.RemoveDNSPolicyForPod(pod); err != nil {
+		log().Errorf("Failed to delete DNS redirection for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
 		return &rpc.DeleteNpReply{Success: false}, err
 	}
 

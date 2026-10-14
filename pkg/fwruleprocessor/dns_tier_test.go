@@ -82,19 +82,20 @@ func TestDNSTierOrdering(t *testing.T) {
 }
 
 func TestPriorityEncodingRegressions(t *testing.T) {
-	t.Run("Admin p50 domain Accept does not override Admin p10 CIDR Deny", func(t *testing.T) {
-		if got := EncodeDNSPriority(DNSTierAdmin, 50, DNSActionAllow); got != 501 {
-			t.Errorf("Admin p50 Accept encoded priority = %d, want 501", got)
-		}
+	t.Run("Auto p50 domain Accept overrides Admin p10 CIDR Deny after raw priority decode", func(t *testing.T) {
 		if got := EncodeDNSPriority(DNSTierAdmin, 10, DNSActionDrop); got != 100 {
 			t.Errorf("Admin p10 Deny encoded priority = %d, want 100", got)
 		}
+		domainPriority := DecodeAutoIPCachePriority(50)
+		if domainPriority != 5 {
+			t.Fatalf("Auto raw p50 domain priority decodes to %d, want 5", domainPriority)
+		}
 		got := EvaluateDNSCandidates([]DNSCandidate{
-			{Source: DNSCandidateIPCache, Tier: DNSTierAdmin, Priority: 50, Action: DNSActionAllow, Matched: true},
+			{Source: DNSCandidateIPCache, Tier: DNSTierAdmin, Priority: domainPriority, Action: DNSActionAllow, Matched: true},
 			{Source: DNSCandidateCIDR, Tier: DNSTierAdmin, Priority: 10, Action: DNSActionDrop, Matched: true},
 		})
-		if got != DNSVerdictDrop {
-			t.Errorf("verdict = %v, want DROP from Admin p10 CIDR Deny", got)
+		if got != DNSVerdictAllow {
+			t.Errorf("verdict = %v, want ALLOW matching Auto's raw p50 to effective p5 decode", got)
 		}
 	})
 

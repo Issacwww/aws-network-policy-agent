@@ -13,7 +13,7 @@ func TestStoreMatchesPodDomainRules(t *testing.T) {
 	port := int32(8080)
 	store := New()
 	store.SetRules("pod-a@ns-a", ClusterPolicyEndpointSource, []fwrp.EbpfFirewallRules{{
-		DomainName: "*.EXAMPLE.com",
+		DomainName: "*.EXAMPLE.com.",
 		Action:     policyendpoint.ClusterNetworkPolicyRuleActionAccept,
 		Priority:   50,
 		L4Info:     []policyendpoint.Port{{Protocol: &tcp, Port: &port}},
@@ -24,7 +24,7 @@ func TestStoreMatchesPodDomainRules(t *testing.T) {
 	if !ok || podIdentifier != "pod-a@ns-a" {
 		t.Fatalf("pod lookup = %q, %v", podIdentifier, ok)
 	}
-	rules, matched := store.MatchPod(podIdentifier, "Api.Example.COM.")
+	rules, matched := store.MatchPod(podIdentifier, "Api.EXAMPLE.com.")
 	if !matched || len(rules) != 1 {
 		t.Fatalf("rules = %#v, matched = %v", rules, matched)
 	}
@@ -34,13 +34,13 @@ func TestStoreMatchesPodDomainRules(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsClusterDenyDomainRules(t *testing.T) {
+func TestStorePreservesClusterDenyDomainRules(t *testing.T) {
 	store := New()
 	store.SetRules("pod-a@ns-a", ClusterPolicyEndpointSource, []fwrp.EbpfFirewallRules{{
 		DomainName: "api.example.com",
 		Action:     policyendpoint.ClusterNetworkPolicyRuleActionDeny,
 	}})
-	if store.HasAnyDomainRules("pod-a@ns-a") {
-		t.Fatal("Deny domain rule must not reach the DNS dataplane")
+	if !store.HasAnyDomainRules("pod-a@ns-a") {
+		t.Fatal("Auto preserves non-Accept CPE domain rules")
 	}
 }

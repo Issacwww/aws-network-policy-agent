@@ -104,3 +104,9 @@ func EncodeDNSPriority(tier DNSTier, priority int, action DNSAction) uint32 {
 	}
 	return uint32(priority*10 + actionValue)
 }
+
+// DecodeAutoIPCachePriority mirrors the eBPF ipcache read path. Auto stores
+// the domain-rule priority unchanged and divides it by ten when evaluating.
+func DecodeAutoIPCachePriority(stored uint32) int {
+	return int(stored / 10)
+}

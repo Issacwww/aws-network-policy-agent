@@ -27,6 +27,7 @@ import (
 	"time"
 
 	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
+	"github.com/aws/aws-network-policy-agent/pkg/discovery"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
@@ -113,6 +114,7 @@ func main() {
 
 	var policyEndpointController *controllers.PolicyEndpointsReconciler
 	var clusterPolicyEndpointController *controllers.ClusterPolicyEndpointsReconciler
+	var dnsProxyManager proxymanager.ProxyManager
 	if ctrlConfig.EnableNetworkPolicy {
 		log.Info("Network Policy is enabled, registering controllers...")
 
@@ -135,26 +137,30 @@ func main() {
 				log.Error("DNS policy is only supported for IPv4 in S1")
 				os.Exit(1)
 			}
-			upstream, err := kubeDNSUpstream(os.Getenv)
+			upstream, err := dnsPolicyUpstream(ctrlConfig.DNSPolicyUpstreamSource, os.Getenv)
 			if err != nil {
-				log.Errorf("Failed to discover kube-dns Service: %v", err)
+				log.Errorf("Failed to discover DNS upstream: %v", err)
 				os.Exit(1)
 			}
-			domainFilter := filter.New()
-			proxyManager, err := proxymanager.New(
+			filter.BpfClient = ebpfClient
+			filter.IsIPv6 = ctrlConfig.EnableIPv6
+			domainFilter := filter.DefaultStore()
+			dnsProxyManager, err = proxymanager.New(
 				log,
 				domainFilter,
 				ebpfClient,
 				upstream,
+				ctrlConfig.EnableIPv6,
+				ctrlConfig.DNSPolicyNftPriority,
 			)
 			if err != nil {
 				log.Errorf("Failed to initialize DNS policy proxy: %v", err)
 				os.Exit(1)
 			}
-			defer proxyManager.Stop()
+			defer dnsProxyManager.Stop()
 			dnsDependencies = append(dnsDependencies, controllers.DNSPolicyDependencies{
 				Filter: domainFilter,
-				Proxy:  proxyManager,
+				Proxy:  dnsProxyManager,
 			})
 		}
 
@@ -183,6 +189,15 @@ func main() {
 
 		if err := mgr.AddReadyzCheck("bpf-fs", ebpf.NewBpfFsReadinessCheck(ebpf.BPF_FS_ROOT)); err != nil {
 			log.Errorf("unable to set up bpf-fs readiness check %v", err)
+			os.Exit(1)
+		}
+		if err := mgr.AddHealthzCheck("dns-proxy", func(_ *http.Request) error {
+			if dnsProxyManager == nil {
+				return nil
+			}
+			return dnsProxyManager.HealthCheckDNSProxy()
+		}); err != nil {
+			log.Errorf("unable to set up DNS proxy health check %v", err)
 			os.Exit(1)
 		}
 	} else {
@@ -241,6 +256,21 @@ func kubeDNSUpstream(getenv func(string) string) (netip.AddrPort, error) {
 		return netip.AddrPort{}, fmt.Errorf("KUBE_DNS_SERVICE_HOST is not a valid IPv4 address: %q", rawIP)
 	}
 	return netip.AddrPortFrom(upstreamIP, 53), nil
+}
+
+func dnsPolicyUpstream(source string, getenv func(string) string) (netip.AddrPort, error) {
+	if source == "kube-dns" {
+		return kubeDNSUpstream(getenv)
+	}
+	dnsIPs, err := discovery.GetDNSIPs("ipv4")
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	upstream, ok := netip.AddrFromSlice(dnsIPs[0].To4())
+	if !ok {
+		return netip.AddrPort{}, fmt.Errorf("Bottlerocket DNS upstream is not IPv4: %s", dnsIPs[0])
+	}
+	return netip.AddrPortFrom(upstream, 53), nil
 }
 
 // loadControllerConfig loads the controller configuration

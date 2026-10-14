@@ -21,9 +21,9 @@ func TestEncodeIPCacheEntryPriorityAndPorts(t *testing.T) {
 		priority     int
 		wantPriority uint32
 	}{
-		{name: "Admin", priority: 50, wantPriority: 501},
-		{name: "namespace", priority: utils.PE_PRIORITY, wantPriority: 15001},
-		{name: "Baseline", priority: fwrp.BASELINE_TIER_PRIORITY_OFFSET + 10, wantPriority: 20101},
+		{name: "Admin raw Auto value", priority: 50, wantPriority: 50},
+		{name: "namespace pre-encoded Auto value", priority: utils.PE_PRIORITY*10 + 1, wantPriority: 15001},
+		{name: "Baseline raw Auto value", priority: fwrp.BASELINE_TIER_PRIORITY_OFFSET + 10, wantPriority: 2010},
 	}
 
 	for _, test := range tests {
@@ -59,6 +59,25 @@ func TestEncodeIPCacheEntryPriorityAndPorts(t *testing.T) {
 				t.Errorf("end port = %d, want %d", got, endPort)
 			}
 		})
+	}
+}
+
+func TestAutoPriorityEncodingDocumentsLowerPriorityAcceptOverride(t *testing.T) {
+	_, value, err := EncodeIPCacheEntry(
+		net.ParseIP("192.0.2.10"),
+		123,
+		[]npatypes.L4Rule{{Priority: 50}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := binary.LittleEndian.Uint32(value.Ports[4:8])
+	effectiveDomainPriority := stored / 10
+	if effectiveDomainPriority != 5 {
+		t.Fatalf("Auto p50 domain priority is read as %d, want 5", effectiveDomainPriority)
+	}
+	if effectiveDomainPriority >= 10 {
+		t.Fatal("test setup no longer documents the Auto p50 Accept override of p10 Deny")
 	}
 }
 

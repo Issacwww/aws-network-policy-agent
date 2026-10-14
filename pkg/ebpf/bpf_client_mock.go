@@ -2,8 +2,10 @@ package ebpf
 
 import (
 	"sync"
+	"sync/atomic"
 
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
+	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -32,6 +34,10 @@ type MockBpfClient struct {
 	UpdateClusterPolicyEbpfMapsErr        error
 	UpdatePodStateEbpfMapsErr             error
 	CreatePodStateEbpfEntryIfNotExistsErr error
+	WriteIPsForPodErr                     error
+	WriteIPsForPodIdCount                 atomic.Uint32
+	LastWrittenIPs                        []npatypes.IPWithTTL
+	LastWrittenL4Rules                    []npatypes.L4Rule
 
 	// Captured args from the most recent UpdateEbpfMaps call.
 	LastIngressRules []fwrp.EbpfFirewallRules
@@ -45,6 +51,13 @@ type MockBpfClient struct {
 	// podIdentifiers with no registered eBPF context. Empty by default so HasBPFContext
 	// reports true, preserving the original success-path behavior.
 	PodIdentifiersWithoutBPFContext map[string]bool
+}
+
+func (m *MockBpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, rules []npatypes.L4Rule) error {
+	m.WriteIPsForPodIdCount.Add(1)
+	m.LastWrittenIPs = append([]npatypes.IPWithTTL(nil), ips...)
+	m.LastWrittenL4Rules = append([]npatypes.L4Rule(nil), rules...)
+	return m.WriteIPsForPodErr
 }
 
 func (m *MockBpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {

@@ -14,13 +14,13 @@ func TestDomainMatchingContract(t *testing.T) {
 		qname   string
 		matched bool
 	}{
-		{name: "exact", pattern: "a.example.com", qname: "a.example.com.", matched: true},
-		{name: "exact does not include child", pattern: "a.example.com", qname: "x.a.example.com.", matched: false},
-		{name: "wildcard includes one label", pattern: "*.a.com", qname: "x.a.com.", matched: true},
-		{name: "wildcard includes multiple labels", pattern: "*.a.com", qname: "y.x.a.com.", matched: true},
-		{name: "wildcard excludes root", pattern: "*.a.com", qname: "a.com.", matched: false},
-		{name: "wildcard excludes suffix lookalike", pattern: "*.a.com", qname: "xa.com.", matched: false},
-		{name: "policy and qname are case insensitive", pattern: "API.Example.COM", qname: "api.EXAMPLE.com.", matched: true},
+		{name: "exact", pattern: "a.example.com.", qname: "a.example.com.", matched: true},
+		{name: "exact does not include child", pattern: "a.example.com.", qname: "x.a.example.com.", matched: false},
+		{name: "wildcard includes one label", pattern: "*.a.com.", qname: "x.a.com.", matched: true},
+		{name: "wildcard includes multiple labels", pattern: "*.a.com.", qname: "y.x.a.com.", matched: true},
+		{name: "wildcard excludes root", pattern: "*.a.com.", qname: "a.com.", matched: false},
+		{name: "wildcard excludes suffix lookalike", pattern: "*.a.com.", qname: "xa.com.", matched: false},
+		{name: "policy and qname retain case", pattern: "API.Example.COM.", qname: "api.EXAMPLE.com.", matched: false},
 	}
 
 	for _, tt := range tests {
@@ -40,7 +40,7 @@ func TestDomainMatchReturnsNumericAndRangePorts(t *testing.T) {
 	port8000 := int32(8000)
 	port8100 := int32(8100)
 	rule := Rule{
-		DomainName: "api.example.com",
+		DomainName: "API.Example.COM.",
 		Ports: []policyk8sawsv1.Port{
 			{Protocol: &tcp, Port: &port80},
 			{Protocol: &tcp, Port: &port8000, EndPort: &port8100},
@@ -50,9 +50,9 @@ func TestDomainMatchReturnsNumericAndRangePorts(t *testing.T) {
 		Action:   policyk8sawsv1.ClusterNetworkPolicyRuleActionAccept,
 	}
 
-	got, matched := New([]Rule{rule}).Match("API.EXAMPLE.COM.")
+	got, matched := New([]Rule{rule}).Match("API.Example.COM.")
 	if !matched {
-		t.Fatal("expected case-insensitive domain match")
+		t.Fatal("expected exact Auto-compatible domain match")
 	}
 	if len(got.Rule.Ports) != 2 {
 		t.Fatalf("matched port count = %d, want numeric port and port range", len(got.Rule.Ports))

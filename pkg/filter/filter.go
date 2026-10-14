@@ -1,15 +1,93 @@
 package filter
 
 import (
-	"sort"
+	"fmt"
 	"strings"
 	"sync"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
+	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
-	"github.com/aws/aws-network-policy-agent/pkg/utils"
 )
+
+var BpfClient ebpf.BpfClient
+var IsIPv6 bool
+
+var defaultStore = New()
+
+func DefaultStore() *Filter {
+	return defaultStore
+}
+
+type PodFilter struct {
+	store         *Filter
+	podIdentifier string
+}
+
+func (f *PodFilter) IsAllowed(domain string) (bool, []npatypes.L4Rule) {
+	rules, matched := f.store.MatchPod(f.podIdentifier, domain)
+	return matched, rules
+}
+
+func SetPolicyEndpointDomains(podIdentifier string, rules []fwrp.EbpfFirewallRules) error {
+	defaultStore.SetRules(podIdentifier, PolicyEndpointSource, rules)
+	return nil
+}
+
+func DeletePolicyEndpointDomains(podIdentifier string) {
+	defaultStore.DeleteRules(podIdentifier, PolicyEndpointSource)
+}
+
+func HasPolicyEndpointDomains(podIdentifier string) bool {
+	defaultStore.mu.RLock()
+	defer defaultStore.mu.RUnlock()
+	pod := defaultStore.pods[podIdentifier]
+	return pod != nil && len(pod.sources[PolicyEndpointSource]) > 0
+}
+
+func SetClusterPolicyEndpointDomains(podIdentifier string, rules []fwrp.EbpfFirewallRules) error {
+	defaultStore.SetRules(podIdentifier, ClusterPolicyEndpointSource, rules)
+	return nil
+}
+
+func DeleteClusterPolicyEndpointDomains(podIdentifier string) {
+	defaultStore.DeleteRules(podIdentifier, ClusterPolicyEndpointSource)
+}
+
+func HasClusterPolicyEndpointDomains(podIdentifier string) bool {
+	defaultStore.mu.RLock()
+	defer defaultStore.mu.RUnlock()
+	pod := defaultStore.pods[podIdentifier]
+	return pod != nil && len(pod.sources[ClusterPolicyEndpointSource]) > 0
+}
+
+func HasAnyDomainRules(podIdentifier string) bool {
+	return defaultStore.HasAnyDomainRules(podIdentifier)
+}
+
+func GetIPFilter(podIdentifier string) (*PodFilter, bool) {
+	if !defaultStore.HasAnyDomainRules(podIdentifier) {
+		return nil, false
+	}
+	return &PodFilter{store: defaultStore, podIdentifier: podIdentifier}, true
+}
+
+func SetPodIPToPodId(podIP, podIdentifier string) {
+	defaultStore.SetPod(podIP, podIdentifier)
+}
+
+func GetPodId(podIP string) (string, error) {
+	podIdentifier, ok := defaultStore.PodIdentifier(podIP)
+	if !ok {
+		return "", fmt.Errorf("podIP %s not found in local mappings", podIP)
+	}
+	return podIdentifier, nil
+}
+
+func DeletePodIPToPodIdEntry(podIP string) {
+	defaultStore.DeletePod(podIP)
+}
 
 type Rule struct {
 	DomainName string
@@ -70,9 +148,14 @@ func New(ruleSets ...[]Rule) *Filter {
 }
 
 func (f *Filter) Match(domain string) (MatchResult, bool) {
-	name := normalizeDomain(domain)
+	name := domain
 	for _, rule := range f.rules {
-		if domainMatches(normalizeDomain(rule.DomainName), name) {
+		if !strings.HasPrefix(rule.DomainName, "*.") && rule.DomainName == name {
+			return MatchResult{Rule: rule}, true
+		}
+	}
+	for _, rule := range f.rules {
+		if strings.HasPrefix(rule.DomainName, "*.") && domainMatches(rule.DomainName, name) {
 			return MatchResult{Rule: rule}, true
 		}
 	}
@@ -119,7 +202,7 @@ func (f *Filter) HasAnyDomainRules(podIdentifier string) bool {
 }
 
 func (f *Filter) MatchPod(podIdentifier, domain string) ([]npatypes.L4Rule, bool) {
-	name := normalizeDomain(domain)
+	name := domain
 	if name == "" {
 		return nil, false
 	}
@@ -132,13 +215,17 @@ func (f *Filter) MatchPod(podIdentifier, domain string) ([]npatypes.L4Rule, bool
 		return nil, false
 	}
 
-	var matched []npatypes.L4Rule
 	for _, entry := range pod.merged {
-		if domainMatches(entry.name, name) {
-			matched = appendUnique(matched, entry.rules...)
+		if !entry.wildcard && entry.name == name {
+			return entry.rules, true
 		}
 	}
-	return matched, len(matched) > 0
+	for _, entry := range pod.merged {
+		if entry.wildcard && domainMatches(entry.name, name) {
+			return entry.rules, true
+		}
+	}
+	return nil, false
 }
 
 func (f *Filter) SetPod(podIP, podIdentifier string) {
@@ -167,71 +254,39 @@ func (f *Filter) rebuildLocked(podIdentifier string, pod *podRules) {
 	}
 
 	byDomain := make(map[string]domainEntry)
-	for _, source := range []Source{PolicyEndpointSource, ClusterPolicyEndpointSource} {
-		for _, entry := range pod.sources[source] {
+	for _, entries := range pod.sources {
+		for _, entry := range entries {
 			existing, ok := byDomain[entry.name]
 			if !ok {
 				byDomain[entry.name] = entry
 				continue
 			}
-			existing.rules = appendUnique(existing.rules, entry.rules...)
+			existing.rules = append(existing.rules, entry.rules...)
 			byDomain[entry.name] = existing
 		}
 	}
 
-	names := make([]string, 0, len(byDomain))
-	for name := range byDomain {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
 	pod.merged = pod.merged[:0]
-	for _, name := range names {
-		pod.merged = append(pod.merged, byDomain[name])
+	for _, entry := range byDomain {
+		pod.merged = append(pod.merged, entry)
 	}
 }
 
 func compileRules(source Source, rules []fwrp.EbpfFirewallRules) []domainEntry {
-	byDomain := make(map[string]domainEntry)
-	for _, rule := range rules {
-		name := normalizeDomain(rule.DomainName)
-		if name == "" {
-			continue
-		}
-		if source == ClusterPolicyEndpointSource &&
-			rule.Action != policyk8sawsv1.ClusterNetworkPolicyRuleActionAccept {
-			continue
-		}
-
-		priority := rule.Priority
-		if source == PolicyEndpointSource {
-			priority = utils.PE_PRIORITY
-		}
-
-		ports := rule.L4Info
-		if len(ports) == 0 {
-			ports = []policyk8sawsv1.Port{{}}
-		}
-		entry := byDomain[name]
-		entry.name = name
-		entry.wildcard = strings.HasPrefix(name, "*.")
-		for _, port := range ports {
-			entry.rules = appendUnique(entry.rules, npatypes.L4Rule{
-				L4PortProtocolInfo: port,
-				Priority:           priority,
-			})
-		}
-		byDomain[name] = entry
+	var byDomain map[string][]npatypes.L4Rule
+	if source == PolicyEndpointSource {
+		byDomain = ComputeDNSProxyRulesFromEbpfFirewallRulesForPE(rules)
+	} else {
+		byDomain = ComputeDNSProxyRulesFromEbpfFirewallRulesForCPE(rules)
 	}
 
-	names := make([]string, 0, len(byDomain))
-	for name := range byDomain {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	entries := make([]domainEntry, 0, len(names))
-	for _, name := range names {
-		entries = append(entries, byDomain[name])
+	entries := make([]domainEntry, 0, len(byDomain))
+	for name, ruleSet := range byDomain {
+		entries = append(entries, domainEntry{
+			name:     name,
+			wildcard: strings.HasPrefix(name, "*."),
+			rules:    ruleSet,
+		})
 	}
 	return entries
 }
@@ -250,10 +305,6 @@ func appendUnique(existing []npatypes.L4Rule, additions ...npatypes.L4Rule) []np
 		}
 	}
 	return existing
-}
-
-func normalizeDomain(domain string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 }
 
 func domainMatches(pattern, domain string) bool {

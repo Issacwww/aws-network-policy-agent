@@ -82,10 +82,12 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 	var (
 		serverDeployment *appsv1.Deployment
 		serverService    *v1.Service
+		priorityService  *v1.Service
 		baselineService  *v1.Service
 		clientPod        *v1.Pod
 		baselineClient   *v1.Pod
 		domainPolicy     *unstructured.Unstructured
+		adminAllowPolicy *unstructured.Unstructured
 		adminDenyPolicy  *unstructured.Unstructured
 		baselinePolicy   *unstructured.Unstructured
 		baselineDeny     *unstructured.Unstructured
@@ -130,6 +132,15 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		serverService, err = fw.ServiceManager.CreateService(ctx, serverService)
 		Expect(err).ToNot(HaveOccurred())
 
+		priorityService = manifest.NewHTTPService().
+			Namespace(s1DNSNamespace).
+			Name("priority-control").
+			Port(8080).
+			Selector("app", "dns-server").
+			Build()
+		priorityService, err = fw.ServiceManager.CreateService(ctx, priorityService)
+		Expect(err).ToNot(HaveOccurred())
+
 		clientPod = manifest.NewDefaultPodBuilder().
 			Namespace(s1DNSNamespace).
 			Name("dns-client").
@@ -147,7 +158,7 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 			Action("Accept").
 			AddPort(8080, "TCP").
 			BuildEgressRule([]map[string]interface{}{
-				manifest.NewDomainNamesPeer([]string{"DNS-SERVER.DNS-POLICY-S1.SVC.CLUSTER.LOCAL"}),
+				manifest.NewDomainNamesPeer([]string{"dns-server.dns-policy-s1.svc.cluster.local"}),
 			})
 		domainPolicy = manifest.NewClusterNetworkPolicyBuilder().
 			Name("s1-domain-allow").
@@ -218,7 +229,7 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		}, time.Minute, 2*time.Second).Should(Equal("ok"))
 	})
 
-	It("drops Admin p50 domain Accept when Admin p10 CIDR Deny also matches", func() {
+	It("preserves Auto's Admin p50 domain Accept override of Admin p10 CIDR Deny", func() {
 		serviceName := "dns-server." + s1DNSNamespace + ".svc.cluster.local"
 		Eventually(func() (string, error) {
 			return fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
@@ -226,12 +237,41 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		}, time.Minute, 2*time.Second).Should(Equal("ok"),
 			"Admin p50 domain Accept must be effective before Admin p10 CIDR Deny is added")
 
+		allowControlRule := manifest.NewClusterEgressRuleBuilder().
+			Name("allow-priority-control").
+			Action("Accept").
+			AddPort(8080, "TCP").
+			BuildEgressRule([]map[string]interface{}{
+				manifest.NewNetworksPeer([]string{priorityService.Spec.ClusterIP + "/32"}),
+			})
+		adminAllowPolicy = manifest.NewClusterNetworkPolicyBuilder().
+			Name("s1-admin-p20-cidr-allow").
+			Priority(20).
+			Tier("Admin").
+			SubjectPods(
+				map[string]string{"test": "dns-policy-s1"},
+				map[string]string{"app": "dns-client"},
+			).
+			AddEgressRule(allowControlRule).
+			Build()
+		Expect(fw.ClusterNetworkPolicyManager.CreateClusterNetworkPolicy(ctx, adminAllowPolicy)).To(Succeed())
+
+		controlIPURL := "http://" + priorityService.Spec.ClusterIP + ":8080"
+		Eventually(func() (string, error) {
+			return fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
+				[]string{"wget", "-qO-", "-T", "3", controlIPURL})
+		}, time.Minute, 2*time.Second).Should(Equal("ok"),
+			"Admin p20 CIDR Accept must authorize the synchronization destination before the p10 Deny")
+
 		denyRule := manifest.NewClusterEgressRuleBuilder().
 			Name("deny-service-ip").
 			Action("Deny").
 			AddPort(8080, "TCP").
 			BuildEgressRule([]map[string]interface{}{
-				manifest.NewNetworksPeer([]string{serverService.Spec.ClusterIP + "/32"}),
+				manifest.NewNetworksPeer([]string{
+					serverService.Spec.ClusterIP + "/32",
+					priorityService.Spec.ClusterIP + "/32",
+				}),
 			})
 		adminDenyPolicy = manifest.NewClusterNetworkPolicyBuilder().
 			Name("s1-admin-p10-cidr-deny").
@@ -247,14 +287,25 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 
 		Eventually(func() error {
 			_, err := fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
-				[]string{"wget", "-qO-", "-T", "3", "http://" + serviceName + ":8080"})
+				[]string{"wget", "-qO-", "-T", "3", controlIPURL})
 			return err
-		}, time.Minute, 2*time.Second).Should(HaveOccurred())
+		}, time.Minute, 2*time.Second).Should(HaveOccurred(),
+			"same-pod control destination must prove the Admin p10 CIDR Deny reached the datapath")
 		Consistently(func() error {
 			_, err := fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
-				[]string{"wget", "-qO-", "-T", "3", "http://" + serviceName + ":8080"})
+				[]string{"wget", "-qO-", "-T", "3", controlIPURL})
 			return err
 		}, 10*time.Second, 2*time.Second).Should(HaveOccurred())
+
+		Eventually(func() (string, error) {
+			return fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
+				[]string{"wget", "-qO-", "-T", "3", "http://" + serviceName + ":8080"})
+		}, time.Minute, 2*time.Second).Should(Equal("ok"),
+			"Auto stores domain priority 50 raw and the datapath decodes it as priority 5")
+		Consistently(func() (string, error) {
+			return fw.PodManager.ExecInPod(s1DNSNamespace, clientPod.Name,
+				[]string{"wget", "-qO-", "-T", "3", "http://" + serviceName + ":8080"})
+		}, 10*time.Second, 2*time.Second).Should(Equal("ok"))
 	})
 
 	It("drops Baseline p10 domain Accept when namespace NetworkPolicy denies business traffic", func() {
@@ -365,6 +416,9 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		if domainPolicy != nil {
 			_ = fw.ClusterNetworkPolicyManager.DeleteClusterNetworkPolicy(ctx, domainPolicy)
 		}
+		if adminAllowPolicy != nil {
+			_ = fw.ClusterNetworkPolicyManager.DeleteClusterNetworkPolicy(ctx, adminAllowPolicy)
+		}
 		if adminDenyPolicy != nil {
 			_ = fw.ClusterNetworkPolicyManager.DeleteClusterNetworkPolicy(ctx, adminDenyPolicy)
 		}
@@ -382,6 +436,9 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		}
 		if serverService != nil {
 			_ = fw.ServiceManager.DeleteService(ctx, serverService)
+		}
+		if priorityService != nil {
+			_ = fw.ServiceManager.DeleteService(ctx, priorityService)
 		}
 		if baselineService != nil {
 			_ = fw.ServiceManager.DeleteService(ctx, baselineService)

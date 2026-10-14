@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
+	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -352,6 +353,58 @@ func ComputeTrieValueForCPE(l4Info []L4Rule) []byte {
 	}
 
 	return value
+}
+
+// ComputeValueForL4Rules encodes DNS ipcache rules exactly as Auto mode does.
+// Priority is already encoded by the controller path and is stored unchanged.
+func ComputeValueForL4Rules(l4Info []npatypes.L4Rule) []byte {
+	value := make([]byte, npatypes.L4RULE_VALUES_LENGTH)
+	if len(l4Info) == 0 {
+		binary.LittleEndian.PutUint32(value[0:4], uint32(ANY_IP_PROTOCOL))
+		binary.LittleEndian.PutUint32(value[4:8], uint32(PE_PRIORITY*10+int(ActionAccept)))
+		return value
+	}
+
+	const entrySize = 16
+	maxEntries := len(value) / entrySize
+	for index, rule := range l4Info {
+		if index >= maxEntries {
+			log().Errorf("No.of unique port/protocol combinations supported for a single endpoint exceeded the supported maximum of %d", maxEntries)
+			return value
+		}
+		offset := index * entrySize
+		protocol := deriveProtocolValueFromL4Rule(rule.L4PortProtocolInfo)
+		var startPort, endPort uint32
+		if rule.L4PortProtocolInfo.Port != nil {
+			startPort = uint32(*rule.L4PortProtocolInfo.Port)
+		}
+		if rule.L4PortProtocolInfo.EndPort != nil {
+			endPort = uint32(*rule.L4PortProtocolInfo.EndPort)
+		}
+		binary.LittleEndian.PutUint32(value[offset:offset+4], uint32(protocol))
+		binary.LittleEndian.PutUint32(value[offset+4:offset+8], uint32(rule.Priority))
+		binary.LittleEndian.PutUint32(value[offset+8:offset+12], startPort)
+		binary.LittleEndian.PutUint32(value[offset+12:offset+16], endPort)
+	}
+	return value
+}
+
+func deriveProtocolValueFromL4Rule(l4Info v1alpha1.Port) int {
+	protocol := ANY_IP_PROTOCOL
+	if l4Info.Protocol == nil {
+		return protocol
+	}
+	switch *l4Info.Protocol {
+	case corev1.ProtocolTCP:
+		protocol = TCP_PROTOCOL_NUMBER
+	case corev1.ProtocolUDP:
+		protocol = UDP_PROTOCOL_NUMBER
+	case corev1.ProtocolSCTP:
+		protocol = SCTP_PROTOCOL_NUMBER
+	case CATCH_ALL_PROTOCOL:
+		protocol = ANY_IP_PROTOCOL
+	}
+	return protocol
 }
 
 func IsL4RuleEmpty(p L4Rule) bool {

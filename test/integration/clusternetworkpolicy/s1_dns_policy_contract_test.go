@@ -403,6 +403,25 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 		}, 10*time.Second, 2*time.Second).Should(HaveOccurred())
 	})
 
+	It("installs the DNS redirect before kube-proxy prerouting DNAT", func() {
+		checkPod := frameworkutils.BuildBPFCheckPod("kube-system", clientPod.Spec.NodeName)
+		checkPod, err := fw.PodManager.CreateAndWaitTillPodIsRunning(ctx, checkPod, s1PodTimeout)
+		Expect(err).ToNot(HaveOccurred())
+		defer func() {
+			_ = fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, checkPod)
+		}()
+
+		Eventually(func() []int {
+			ruleset, execErr := fw.PodManager.ExecInPod("kube-system", checkPod.Name,
+				[]string{"chroot", "/host", "nft", "-nn", "list", "table", "ip", "dns_redirect"})
+			if execErr != nil {
+				return nil
+			}
+			return dnsRedirectPreroutingPriorities(ruleset)
+		}, time.Minute, 2*time.Second).Should(ContainElement(BeNumerically("<", -100)),
+			"DNS redirect chain must run before kube-proxy DNAT priority -100")
+	})
+
 	AfterAll(func() {
 		if dnsAllowPolicy != nil {
 			_ = fw.ClusterNetworkPolicyManager.DeleteClusterNetworkPolicy(ctx, dnsAllowPolicy)
@@ -450,31 +469,8 @@ var _ = Describe("S1 explicit DNS allow contract", Ordered, ContinueOnFailure, f
 	})
 })
 
-var _ = Describe("S1 DNS redirect order", func() {
-	It("installs the DNS redirect before kube-proxy prerouting DNAT", func() {
-		nodes := &v1.NodeList{}
-		Expect(fw.K8sClient.List(ctx, nodes)).To(Succeed())
-		Expect(nodes.Items).ToNot(BeEmpty())
-
-		checkPod := frameworkutils.BuildBPFCheckPod("kube-system", nodes.Items[0].Name)
-		checkPod, err := fw.PodManager.CreateAndWaitTillPodIsRunning(ctx, checkPod, s1PodTimeout)
-		Expect(err).ToNot(HaveOccurred())
-		defer func() {
-			_ = fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, checkPod)
-		}()
-
-		ruleset, err := fw.PodManager.ExecInPod("kube-system", checkPod.Name,
-			[]string{"chroot", "/host", "nft", "-nn", "list", "ruleset"})
-		Expect(err).ToNot(HaveOccurred())
-
-		priorities := dnsRedirectPreroutingPriorities(ruleset)
-		Expect(priorities).To(ContainElement(BeNumerically("<", -100)),
-			"DNS redirect chain must run before kube-proxy DNAT priority -100")
-	})
-})
-
 func dnsRedirectPreroutingPriorities(ruleset string) []int {
-	chainPattern := regexp.MustCompile(`(?ms)chain\s+\S+\s*\{(.*?)\n\s*\}`)
+	chainPattern := regexp.MustCompile(`(?ms)chain\s+prerouting\s*\{(.*?)\n\s*\}`)
 	priorityPattern := regexp.MustCompile(`hook\s+prerouting\s+priority\s+(-?\d+)`)
 	var priorities []int
 

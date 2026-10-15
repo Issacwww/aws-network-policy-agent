@@ -30,6 +30,7 @@ IMAGE_ARCH_SUFFIX = $(addprefix -,$(filter $(ARCH),arm64))
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.25.0
+ENVTEST_VERSION = v0.25.2
 
 # Skip installing the latest managed addon while running cyclonus test
 SKIP_ADDON_INSTALLATION ?= "false"
@@ -86,7 +87,9 @@ vet: setup-ebpf-sdk-override # Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./pkg/... ./controllers/... -v -coverprofile=coverage.txt -covermode=atomic
+	KUBEBUILDER_ASSETS="$$( $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )"; \
+		test -n "$$KUBEBUILDER_ASSETS"; \
+		KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test ./pkg/... ./controllers/... -v -coverprofile=coverage.txt -covermode=atomic
 
 ##@ Build
 
@@ -291,9 +294,13 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
 
 .PHONY: envtest
-envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
-$(ENVTEST): $(LOCALBIN)
-	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20230216140739-c98506dc3b8e
+envtest: $(LOCALBIN) ## Download the pinned setup-envtest locally if necessary.
+	if [[ "$(ENVTEST)" == "$(LOCALBIN)/setup-envtest" ]]; then \
+		[[ "$$($(ENVTEST) version 2>/dev/null)" == "setup-envtest version: $(ENVTEST_VERSION)" ]] || \
+			GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION); \
+	else \
+		test -x "$(ENVTEST)"; \
+	fi
 
 # Check formatting of source code files without modification.
 check-format: FORMAT_FLAGS = -l

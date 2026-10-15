@@ -97,3 +97,40 @@ func TestAutoConformanceExactRuleWinsOverEarlierWildcard(t *testing.T) {
 		t.Fatalf("match = %#v, %v; want exact rule priority 200", result, matched)
 	}
 }
+
+func TestAutoConformanceReusedIPOverwritesPodAttribution(t *testing.T) {
+	store := New()
+	store.SetPod("10.0.0.10", "old@default")
+	store.SetPod("10.0.0.10", "new@default")
+
+	podIdentifier, ok := store.PodIdentifier("10.0.0.10")
+	if !ok || podIdentifier != "new@default" {
+		t.Fatalf("reused IP attribution = %q, %v; want new@default", podIdentifier, ok)
+	}
+}
+
+func TestAutoConformanceReplacingOneSourceReplacesDomainsAndPorts(t *testing.T) {
+	tcp := corev1.ProtocolTCP
+	port80 := int32(80)
+	port443 := int32(443)
+	store := New()
+	store.SetRules("pod@ns", PolicyEndpointSource, []fwrp.EbpfFirewallRules{{
+		DomainName: "old.example.com.",
+		Priority:   15001,
+		L4Info:     []policyendpoint.Port{{Protocol: &tcp, Port: &port80}},
+	}})
+	store.SetRules("pod@ns", PolicyEndpointSource, []fwrp.EbpfFirewallRules{{
+		DomainName: "new.example.com.",
+		Priority:   15001,
+		L4Info:     []policyendpoint.Port{{Protocol: &tcp, Port: &port443}},
+	}})
+
+	if _, matched := store.MatchPod("pod@ns", "old.example.com."); matched {
+		t.Fatal("replaced source must stop matching its old domain")
+	}
+	rules, matched := store.MatchPod("pod@ns", "new.example.com.")
+	if !matched || len(rules) != 1 || rules[0].L4PortProtocolInfo.Port == nil ||
+		*rules[0].L4PortProtocolInfo.Port != port443 {
+		t.Fatalf("replacement rules = %#v, %v; want new TCP/443 rule", rules, matched)
+	}
+}

@@ -1,14 +1,20 @@
 package proxymanager
 
 import (
+	"context"
 	"errors"
+	"net"
+	"net/http"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 
+	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
+	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
@@ -110,6 +116,9 @@ func TestAutoConformanceFailedLazyStartMakesRuntimeHealthFail(t *testing.T) {
 		AutoNftChainPriority,
 	)
 	manager.setupListener = func(netip.AddrPort) error { return nil }
+	if err := manager.HealthCheckDNSProxy(); err != nil {
+		t.Fatalf("health before the first lazy start = %v, want healthy", err)
+	}
 	err := manager.SyncPod(
 		npatypes.Pod{NamespacedName: types.NamespacedName{Name: "workload-a", Namespace: "default"}},
 		"workload@default",
@@ -119,6 +128,144 @@ func TestAutoConformanceFailedLazyStartMakesRuntimeHealthFail(t *testing.T) {
 	}
 	if err := manager.HealthCheckDNSProxy(); err == nil {
 		t.Fatal("runtime health must fail after a lazy startup failure")
+	}
+}
+
+func TestAutoConformanceHealthRetriesThreeTimesAndUsesListenerPortPlusOne(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthPort := listener.Addr().(*net.TCPAddr).Port
+	if healthPort <= 1 {
+		t.Fatalf("unexpected health port %d", healthPort)
+	}
+
+	var calls atomic.Int32
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 3 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Shutdown(context.Background())
+	})
+
+	coreDNS := newCoreDNSServer(
+		logger.Get(),
+		&ebpf.MockBpfClient{},
+		false,
+		netip.MustParseAddrPort("10.100.0.10:53"),
+		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(healthPort-1)),
+	)
+	manager := newManager(
+		logger.Get(),
+		filter.New(),
+		&recordingRedirects{},
+		coreDNS,
+		func(types.NamespacedName) (string, error) { return "eni-test", nil },
+		func(string) (string, error) { return "10.0.0.10", nil },
+		AutoNftChainPriority,
+	)
+	manager.started = true
+
+	if err := manager.HealthCheckDNSProxy(); err != nil {
+		t.Fatalf("health retry: %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("health attempts = %d, want 3", got)
+	}
+	if got := coreDNS.healthAddress(); got != listener.Addr().String() {
+		t.Fatalf("health address = %q, want %q", got, listener.Addr())
+	}
+}
+
+func TestAutoConformanceFailedProxyStartCanRetry(t *testing.T) {
+	rules := filter.New()
+	rules.SetRules("workload@default", filter.PolicyEndpointSource, []fwrp.EbpfFirewallRules{{
+		DomainName: "example.com.",
+	}})
+	redirects := &recordingRedirects{}
+	proxy := &recordingProxy{startErr: errors.New("injected startup failure")}
+	manager := newManager(
+		logger.Get(),
+		rules,
+		redirects,
+		proxy,
+		func(types.NamespacedName) (string, error) { return "eni-test", nil },
+		func(string) (string, error) { return "10.0.0.10", nil },
+		AutoNftChainPriority,
+	)
+	manager.setupListener = func(netip.AddrPort) error { return nil }
+	pod := npatypes.Pod{
+		NamespacedName: types.NamespacedName{Name: "workload-a", Namespace: "default"},
+		PodIP:          "10.0.0.10",
+	}
+
+	if err := manager.SyncPod(pod, "workload@default"); err == nil {
+		t.Fatal("expected injected startup failure")
+	}
+	if redirects.initializeCalls != 1 || proxy.startCalls != 1 {
+		t.Fatalf("first start = init %d proxy %d, want 1/1", redirects.initializeCalls, proxy.startCalls)
+	}
+
+	proxy.startErr = nil
+	if err := manager.SyncPod(pod, "workload@default"); err != nil {
+		t.Fatalf("retry SyncPod: %v", err)
+	}
+	if redirects.initializeCalls != 1 || proxy.startCalls != 2 || len(redirects.adds) != 1 {
+		t.Fatalf(
+			"retry = init %d proxy %d adds %d, want 1/2/1",
+			redirects.initializeCalls,
+			proxy.startCalls,
+			len(redirects.adds),
+		)
+	}
+	if err := manager.HealthCheckDNSProxy(); err != nil {
+		t.Fatalf("health after successful retry: %v", err)
+	}
+}
+
+func TestAutoConformanceIPv6ListenerAndRedirectFamily(t *testing.T) {
+	proxyManager, err := New(
+		logger.Get(),
+		filter.New(),
+		&ebpf.MockBpfClient{},
+		netip.MustParseAddrPort("[2001:db8::53]:53"),
+		true,
+		AutoNftChainPriority,
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	manager := proxyManager.(*manager)
+	server := manager.proxy.(*coreDNSServer)
+	if got := server.listener.String(); got != IPv6ListenerAddress {
+		t.Fatalf("IPv6 listener = %q, want %q", got, IPv6ListenerAddress)
+	}
+	if got := server.healthAddress(); got != "[fd00::53]:50053" {
+		t.Fatalf("IPv6 health address = %q, want [fd00::53]:50053", got)
+	}
+
+	redirects := manager.redirects.(*nftRules)
+	expressions := redirects.redirectExpressions(unix.IPPROTO_UDP, "eni-test")
+	var nat *expr.NAT
+	for _, expression := range expressions {
+		if candidate, ok := expression.(*expr.NAT); ok {
+			nat = candidate
+			break
+		}
+	}
+	if nat == nil {
+		t.Fatal("IPv6 redirect expressions have no DNAT operation")
+	}
+	if nat.Family != uint32(nftables.TableFamilyIPv6) {
+		t.Fatalf("IPv6 DNAT family = %d, want %d", nat.Family, nftables.TableFamilyIPv6)
 	}
 }
 
@@ -216,11 +363,41 @@ func TestAutoConformancePEAndCPELifecycleKeepsRedirectUntilLastSource(t *testing
 	}
 }
 
+func TestAutoConformanceStopCleansRedirectsAndRunningProxy(t *testing.T) {
+	cleanupErr := errors.New("injected nft cleanup failure")
+	stopErr := errors.New("injected proxy stop failure")
+	redirects := &recordingRedirects{cleanupErr: cleanupErr}
+	proxy := &recordingProxy{stopErr: stopErr}
+	manager := newManager(
+		logger.Get(),
+		filter.New(),
+		redirects,
+		proxy,
+		func(types.NamespacedName) (string, error) { return "", nil },
+		func(string) (string, error) { return "", nil },
+		AutoNftChainPriority,
+	)
+	manager.started = true
+
+	err := manager.Stop()
+	if !errors.Is(err, cleanupErr) || !errors.Is(err, stopErr) {
+		t.Fatalf("Stop error = %v, want joined cleanup and proxy errors", err)
+	}
+	if redirects.cleanupCalls != 1 || proxy.stopCalls != 1 {
+		t.Fatalf("stop calls = cleanup %d proxy %d, want 1/1", redirects.cleanupCalls, proxy.stopCalls)
+	}
+	if manager.started {
+		t.Fatal("manager must clear its started state after Stop")
+	}
+}
+
 type recordingRedirects struct {
 	initializeCalls int
 	adds            []RedirectRequest
 	deletes         []string
 	deleteErr       error
+	cleanupCalls    int
+	cleanupErr      error
 }
 
 func (r *recordingRedirects) Initialize() error {
@@ -238,12 +415,16 @@ func (r *recordingRedirects) Delete(hostVeth string) error {
 	return r.deleteErr
 }
 
-func (r *recordingRedirects) Cleanup() error { return nil }
+func (r *recordingRedirects) Cleanup() error {
+	r.cleanupCalls++
+	return r.cleanupErr
+}
 
 type recordingProxy struct {
 	startCalls int
 	stopCalls  int
 	startErr   error
+	stopErr    error
 }
 
 func (p *recordingProxy) Start() error {
@@ -253,5 +434,5 @@ func (p *recordingProxy) Start() error {
 
 func (p *recordingProxy) Stop() error {
 	p.stopCalls++
-	return nil
+	return p.stopErr
 }

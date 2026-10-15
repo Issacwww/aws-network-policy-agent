@@ -2,18 +2,16 @@ package ebpf
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 
 	"sync"
 	"time"
 	"unsafe"
-
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
@@ -36,34 +34,33 @@ import (
 )
 
 var (
-	TC_INGRESS_BINARY                                = "tc.v4ingress.bpf.o"
-	TC_EGRESS_BINARY                                 = "tc.v4egress.bpf.o"
-	TC_DNS_EGRESS_BINARY                             = "tc.v4egress.dns.bpf.o"
-	TC_V6_INGRESS_BINARY                             = "tc.v6ingress.bpf.o"
-	TC_V6_EGRESS_BINARY                              = "tc.v6egress.bpf.o"
-	EVENTS_BINARY                                    = "v4events.bpf.o"
-	EVENTS_V6_BINARY                                 = "v6events.bpf.o"
-	AWS_CONNTRACK_MAP                                = "aws_conntrack_map"
-	AWS_EVENTS_MAP                                   = "policy_events"
-	EKS_CLI_BINARY                                   = "aws-eks-na-cli"
-	EKS_V6_CLI_BINARY                                = "aws-eks-na-cli-v6"
-	hostBinaryPath                                   = "/host/opt/cni/bin/"
-	IPv4_HOST_MASK                                   = "/32"
-	IPv6_HOST_MASK                                   = "/128"
-	CONNTRACK_MAP_PIN_PATH                           = "/sys/fs/bpf/globals/aws/maps/global_aws_conntrack_map"
-	POLICY_EVENTS_MAP_PIN_PATH                       = "/sys/fs/bpf/globals/aws/maps/global_policy_events"
-	CATCH_ALL_PROTOCOL               corev1.Protocol = "ANY_IP_PROTOCOL"
-	POD_VETH_PREFIX                                  = "eni"
-	POLICIES_APPLIED                                 = 0
-	DEFAULT_ALLOW                                    = 1
-	DEFAULT_DENY                                     = 2
-	POD_STATE_MAP_KEY                                = 0
-	CLUSTER_POLICY_POD_STATE_MAP_KEY                 = 1
-	BRANCH_ENI_VETH_PREFIX                           = "vlan"
-	INTERFACE_COUNT_UNKNOWN                          = -1 // Used when caller doesn't know interface count
-	INTERFACE_COUNT_DEFAULT                          = 1  // Default single interface
-	IPAM_JSON_PATH                                   = "/var/run/aws-node/ipam.json"
-	deletedPodsMinAge                                = 5 * time.Minute
+	TC_INGRESS_BINARY                = "tc.v4ingress.bpf.o"
+	TC_EGRESS_BINARY                 = "tc.v4egress.bpf.o"
+	TC_DNS_EGRESS_BINARY             = "tc.v4egress.dns.bpf.o"
+	TC_V6_INGRESS_BINARY             = "tc.v6ingress.bpf.o"
+	TC_V6_EGRESS_BINARY              = "tc.v6egress.bpf.o"
+	EVENTS_BINARY                    = "v4events.bpf.o"
+	EVENTS_V6_BINARY                 = "v6events.bpf.o"
+	AWS_CONNTRACK_MAP                = "aws_conntrack_map"
+	AWS_EVENTS_MAP                   = "policy_events"
+	EKS_CLI_BINARY                   = "aws-eks-na-cli"
+	EKS_V6_CLI_BINARY                = "aws-eks-na-cli-v6"
+	hostBinaryPath                   = "/host/opt/cni/bin/"
+	IPv4_HOST_MASK                   = "/32"
+	IPv6_HOST_MASK                   = "/128"
+	CONNTRACK_MAP_PIN_PATH           = "/sys/fs/bpf/globals/aws/maps/global_aws_conntrack_map"
+	POLICY_EVENTS_MAP_PIN_PATH       = "/sys/fs/bpf/globals/aws/maps/global_policy_events"
+	POD_VETH_PREFIX                  = "eni"
+	POLICIES_APPLIED                 = 0
+	DEFAULT_ALLOW                    = 1
+	DEFAULT_DENY                     = 2
+	POD_STATE_MAP_KEY                = 0
+	CLUSTER_POLICY_POD_STATE_MAP_KEY = 1
+	BRANCH_ENI_VETH_PREFIX           = "vlan"
+	INTERFACE_COUNT_UNKNOWN          = -1 // Used when caller doesn't know interface count
+	INTERFACE_COUNT_DEFAULT          = 1  // Default single interface
+	IPAM_JSON_PATH                   = "/var/run/aws-node/ipam.json"
+	deletedPodsMinAge                = 5 * time.Minute
 )
 
 var ErrPodDeleted = errors.New("pod has been deleted")
@@ -377,9 +374,10 @@ type bpfClient struct {
 	clusterPolicyEgressInMemoryMap *sync.Map
 	// This is in-memory map to track recently deleted pods (key: podNamespacedName, value: time added to map)
 	deletedPods *sync.Map
-	// enableIPv6 disables the S1 IPv4-only DNS ipcache path in IPv6 mode.
+	// enableIPv6 selects IPv6 key and probe handling, including the DNS ipcache.
 	enableIPv6 bool
 	// enableDNSPolicy selects the opt-in IPv4 egress binary that contains the DNS ipcache.
+	// The IPv6 egress binary includes the map unconditionally, matching Auto.
 	enableDNSPolicy bool
 }
 
@@ -743,55 +741,92 @@ func (l *bpfClient) getInterfaceCountForPod(pod types.NamespacedName, podIdentif
 	return 0, errors.New("Skipping probe attach: multiNIC enabled and interface count is unknown")
 }
 
-func EncodeIPCacheEntry(ip net.IP, expiryTime uint64, l4Rules []npatypes.L4Rule) (uint32, npatypes.IPCacheVal, error) {
+func encodeIPCacheKey(ip net.IP, enableIPv6 bool) ([16]byte, error) {
+	var key [16]byte
+	if enableIPv6 {
+		ipv6 := ip.To16()
+		if ipv6 == nil || ip.To4() != nil {
+			return key, fmt.Errorf("IP %q is not IPv6", ip)
+		}
+		copy(key[:], ipv6)
+		return key, nil
+	}
+
 	ipv4 := ip.To4()
 	if ipv4 == nil {
-		return 0, npatypes.IPCacheVal{}, fmt.Errorf("IP %q is not IPv4", ip)
+		return key, fmt.Errorf("IP %q is not IPv4", ip)
 	}
+	copy(key[:4], ipv4)
+	return key, nil
+}
 
-	const (
-		l4RuleSize = 16
-		maxL4Rules = npatypes.L4RULE_VALUES_LENGTH / l4RuleSize
+type ipcacheMapWriter interface {
+	writeIPCacheEntry(key *[16]byte, value *npatypes.IPCacheVal, updateFlags uint64) error
+}
+
+type bpfIPCacheMapWriter struct {
+	ipcacheMap *goebpfmaps.BpfMap
+}
+
+func (w bpfIPCacheMapWriter) writeIPCacheEntry(
+	key *[16]byte,
+	value *npatypes.IPCacheVal,
+	updateFlags uint64,
+) error {
+	err := w.ipcacheMap.CreateUpdateMapEntry(
+		uintptr(unsafe.Pointer(&key[0])),
+		uintptr(unsafe.Pointer(value)),
+		updateFlags,
 	)
-	if len(l4Rules) > maxL4Rules {
-		return 0, npatypes.IPCacheVal{}, fmt.Errorf("too many L4 rules: got %d, maximum is %d", len(l4Rules), maxL4Rules)
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(value)
+	return err
+}
+
+type encodedIPCacheEntry struct {
+	ip    net.IP
+	key   [16]byte
+	value npatypes.IPCacheVal
+}
+
+func encodeIPCacheEntries(
+	enableIPv6 bool,
+	nowNs uint64,
+	ips []npatypes.IPWithTTL,
+	l4Rules []npatypes.L4Rule,
+) []encodedIPCacheEntry {
+	l4RulesBytes := utils.ComputeValueForL4Rules(l4Rules)
+	entries := make([]encodedIPCacheEntry, 0, len(ips))
+	for _, ipWithTTL := range ips {
+		key, err := encodeIPCacheKey(ipWithTTL.IP, enableIPv6)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, encodedIPCacheEntry{
+			ip:  ipWithTTL.IP,
+			key: key,
+			value: npatypes.IPCacheVal{
+				ExpiryTime: nowNs + uint64(ipWithTTL.TTL)*uint64(time.Second),
+				Ports:      [npatypes.L4RULE_VALUES_LENGTH]byte(l4RulesBytes),
+			},
+		})
 	}
+	return entries
+}
 
-	value := npatypes.IPCacheVal{ExpiryTime: expiryTime}
-	for index, rule := range l4Rules {
-		offset := index * l4RuleSize
-		protocol := utils.ANY_IP_PROTOCOL
-		if rule.L4PortProtocolInfo.Protocol != nil {
-			switch *rule.L4PortProtocolInfo.Protocol {
-			case corev1.ProtocolTCP:
-				protocol = utils.TCP_PROTOCOL_NUMBER
-			case corev1.ProtocolUDP:
-				protocol = utils.UDP_PROTOCOL_NUMBER
-			case corev1.ProtocolSCTP:
-				protocol = utils.SCTP_PROTOCOL_NUMBER
-			case CATCH_ALL_PROTOCOL:
-				protocol = utils.ANY_IP_PROTOCOL
-			default:
-				return 0, npatypes.IPCacheVal{}, fmt.Errorf("unsupported protocol %q", *rule.L4PortProtocolInfo.Protocol)
-			}
-		} else if rule.L4PortProtocolInfo.Port != nil || rule.L4PortProtocolInfo.EndPort != nil {
-			protocol = utils.TCP_PROTOCOL_NUMBER
+func writeIPCacheEntries(
+	ipcacheMap ipcacheMapWriter,
+	enableIPv6 bool,
+	nowNs uint64,
+	ips []npatypes.IPWithTTL,
+	l4Rules []npatypes.L4Rule,
+) error {
+	for _, entry := range encodeIPCacheEntries(enableIPv6, nowNs, ips, l4Rules) {
+		if err := ipcacheMap.writeIPCacheEntry(&entry.key, &entry.value, 0); err != nil {
+			return fmt.Errorf("write IP %s to %s: %w", entry.ip, utils.TC_IPCACHE_MAP, err)
 		}
-
-		var startPort, endPort uint32
-		if rule.L4PortProtocolInfo.Port != nil {
-			startPort = uint32(*rule.L4PortProtocolInfo.Port)
-		}
-		if rule.L4PortProtocolInfo.EndPort != nil {
-			endPort = uint32(*rule.L4PortProtocolInfo.EndPort)
-		}
-
-		binary.LittleEndian.PutUint32(value.Ports[offset:offset+4], uint32(protocol))
-		binary.LittleEndian.PutUint32(value.Ports[offset+4:offset+8], uint32(rule.Priority))
-		binary.LittleEndian.PutUint32(value.Ports[offset+8:offset+12], startPort)
-		binary.LittleEndian.PutUint32(value.Ports[offset+12:offset+16], endPort)
 	}
-	return binary.LittleEndian.Uint32(ipv4), value, nil
+	return nil
 }
 
 func (l *bpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error {
@@ -817,35 +852,13 @@ func (l *bpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTT
 	if err != nil {
 		return fmt.Errorf("get boot time: %w", err)
 	}
-	l4RulesBytes := utils.ComputeValueForL4Rules(l4Rules)
-	for _, ipWithTTL := range ips {
-		mapValue := npatypes.IPCacheVal{
-			ExpiryTime: nowNs + uint64(ipWithTTL.TTL)*uint64(time.Second),
-			Ports:      [npatypes.L4RULE_VALUES_LENGTH]byte(l4RulesBytes),
-		}
-
-		var keyPtr uintptr
-		if l.enableIPv6 {
-			ipv6 := ipWithTTL.IP.To16()
-			if ipv6 == nil {
-				continue
-			}
-			var key [16]byte
-			copy(key[:], ipv6)
-			keyPtr = uintptr(unsafe.Pointer(&key))
-		} else {
-			ipv4 := ipWithTTL.IP.To4()
-			if ipv4 == nil {
-				continue
-			}
-			key := binary.LittleEndian.Uint32(ipv4)
-			keyPtr = uintptr(unsafe.Pointer(&key))
-		}
-		if err := ipcacheMap.CreateUpdateMapEntry(keyPtr, uintptr(unsafe.Pointer(&mapValue)), 0); err != nil {
-			return fmt.Errorf("write IP %s to %s: %w", ipWithTTL.IP, utils.TC_IPCACHE_MAP, err)
-		}
-	}
-	return nil
+	return writeIPCacheEntries(
+		bpfIPCacheMapWriter{ipcacheMap: &ipcacheMap},
+		l.enableIPv6,
+		nowNs,
+		ips,
+		l4Rules,
+	)
 }
 
 func ktimeBootNs() (uint64, error) {

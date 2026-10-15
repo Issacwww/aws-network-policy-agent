@@ -19,7 +19,10 @@ func GetDNSIPs(ipFamily string) ([]net.IP, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error in getting userdata %w", err)
 	}
+	return dnsIPsForFamily(userData, ipFamily)
+}
 
+func dnsIPsForFamily(userData *UserData, ipFamily string) ([]net.IP, error) {
 	uniqueDNSIPs := make(map[string]struct{})
 	for _, serviceCIDR := range userData.Coredns.ServiceCIDR {
 		if dnsIP, err := cidrToIP(serviceCIDR); err == nil {

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
@@ -133,11 +134,11 @@ func main() {
 
 		var dnsDependencies []controllers.DNSPolicyDependencies
 		if ctrlConfig.EnableDNSPolicy {
-			if ctrlConfig.EnableIPv6 {
-				log.Error("DNS policy is only supported for IPv4 in S1")
-				os.Exit(1)
-			}
-			upstream, err := dnsPolicyUpstream(ctrlConfig.DNSPolicyUpstreamSource, os.Getenv)
+			upstream, err := dnsPolicyUpstream(
+				ctrlConfig.DNSPolicyUpstreamSource,
+				ctrlConfig.EnableIPv6,
+				os.Getenv,
+			)
 			if err != nil {
 				log.Errorf("Failed to discover DNS upstream: %v", err)
 				os.Exit(1)
@@ -249,26 +250,50 @@ func main() {
 
 }
 
-func kubeDNSUpstream(getenv func(string) string) (netip.AddrPort, error) {
+func kubeDNSUpstream(getenv func(string) string, enableIPv6 bool) (netip.AddrPort, error) {
 	rawIP := getenv("KUBE_DNS_SERVICE_HOST")
 	upstreamIP, err := netip.ParseAddr(rawIP)
-	if err != nil || !upstreamIP.Is4() {
-		return netip.AddrPort{}, fmt.Errorf("KUBE_DNS_SERVICE_HOST is not a valid IPv4 address: %q", rawIP)
+	if err != nil || upstreamIP.Is4() == enableIPv6 {
+		family := "IPv4"
+		if enableIPv6 {
+			family = "IPv6"
+		}
+		return netip.AddrPort{}, fmt.Errorf("KUBE_DNS_SERVICE_HOST is not a valid %s address: %q", family, rawIP)
 	}
 	return netip.AddrPortFrom(upstreamIP, 53), nil
 }
 
-func dnsPolicyUpstream(source string, getenv func(string) string) (netip.AddrPort, error) {
+func dnsPolicyUpstream(source string, enableIPv6 bool, getenv func(string) string) (netip.AddrPort, error) {
+	return dnsPolicyUpstreamWithDiscovery(source, enableIPv6, getenv, discovery.GetDNSIPs)
+}
+
+func dnsPolicyUpstreamWithDiscovery(
+	source string,
+	enableIPv6 bool,
+	getenv func(string) string,
+	discover func(string) ([]net.IP, error),
+) (netip.AddrPort, error) {
 	if source == "kube-dns" {
-		return kubeDNSUpstream(getenv)
+		return kubeDNSUpstream(getenv, enableIPv6)
 	}
-	dnsIPs, err := discovery.GetDNSIPs("ipv4")
+	family := "ipv4"
+	if enableIPv6 {
+		family = "ipv6"
+	}
+	dnsIPs, err := discover(family)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
-	upstream, ok := netip.AddrFromSlice(dnsIPs[0].To4())
+	if len(dnsIPs) == 0 {
+		return netip.AddrPort{}, fmt.Errorf("Bottlerocket DNS discovery returned no %s addresses", family)
+	}
+	upstream, ok := netip.AddrFromSlice(dnsIPs[0])
 	if !ok {
-		return netip.AddrPort{}, fmt.Errorf("Bottlerocket DNS upstream is not IPv4: %s", dnsIPs[0])
+		return netip.AddrPort{}, fmt.Errorf("Bottlerocket DNS upstream is invalid: %s", dnsIPs[0])
+	}
+	upstream = upstream.Unmap()
+	if upstream.Is4() == enableIPv6 {
+		return netip.AddrPort{}, fmt.Errorf("Bottlerocket DNS upstream is not %s: %s", family, dnsIPs[0])
 	}
 	return netip.AddrPortFrom(upstream, 53), nil
 }

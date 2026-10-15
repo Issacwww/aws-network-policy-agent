@@ -105,6 +105,25 @@ struct data_t {
 	__u8 tier;
 };
 
+#ifdef ENABLE_DNS_POLICY
+struct ipcache_key {
+	__u32 ip;
+};
+
+struct ipcache_value {
+	__u64 expiry_time;
+	struct lpm_cp_trie_val ports[MAX_PORT_PROTOCOL];
+};
+
+struct bpf_map_def_pvt SEC("maps") ipcache_map = {
+	.type = BPF_MAP_TYPE_LRU_HASH,
+	.key_size = sizeof(struct ipcache_key),
+	.value_size = sizeof(struct ipcache_value),
+	.max_entries = 65536,
+	.pinning = PIN_GLOBAL_NS,
+};
+
+#endif
 struct bpf_map_def_pvt SEC("maps") cp_egress_map = {
 	.type = BPF_MAP_TYPE_LPM_TRIE,
 	.key_size = sizeof(struct lpm_trie_key),
@@ -139,6 +158,139 @@ struct bpf_map_def_pvt SEC("maps") egress_pod_state_map = {
 struct bpf_map_def_pvt aws_conntrack_map;
 struct bpf_map_def_pvt policy_events;
 
+#ifdef ENABLE_DNS_POLICY
+// DNS cache priorities per tier, packed to keep checkIPCache under the arg limit.
+struct dns_cache_prio {
+    __u32 admin;
+    __u32 ns;
+    __u32 baseline;
+};
+
+// DNS rule priorities per tier. __noinline so the verifier walks the loop once.
+static __attribute__((noinline)) int checkIPCache(__u32 dest_ip, __u16 dest_port, __u8 protocol,
+                                                  struct dns_cache_prio *out) {
+    struct ipcache_key cache_key = {.ip = dest_ip};
+    out->admin = MAX_RULE_PRIORITY;
+    out->ns = MAX_RULE_PRIORITY;
+    out->baseline = MAX_RULE_PRIORITY;
+
+    int action = ACTION_PASS;
+
+    struct ipcache_value *cache_val = bpf_map_lookup_elem(&ipcache_map, &cache_key);
+    if (!cache_val) return action;
+
+    // Check expiry
+    __u64 current_time = bpf_ktime_get_ns();
+    if (cache_val->expiry_time < current_time) return action;
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < MAX_PORT_PROTOCOL; i++) {
+        struct lpm_cp_trie_val *port_entry = &cache_val->ports[i];
+        if (port_entry->protocol == 0) continue;
+
+        __u32 priority = port_entry->priority / 10;
+
+        // Check protocol and port match
+        if ((port_entry->protocol == ANY_IP_PROTOCOL || port_entry->protocol == protocol) &&
+            (port_entry->start_port == ANY_PORT || dest_port == port_entry->start_port ||
+             (port_entry->end_port > 0 && dest_port >= port_entry->start_port && dest_port <= port_entry->end_port))) {
+
+            // Get Admin Tier Priority
+            if (priority < out->admin) {
+                out->admin = priority;
+            }
+            // Get Namespace Tier Priority
+            if (priority == NETWORK_POLICY_TIER_PRIORITY) {
+                out->ns = priority;
+            }
+            // Get Baseline Tier Priority
+            if (priority < out->baseline && priority > NETWORK_POLICY_TIER_PRIORITY) {
+                out->baseline = priority;
+            }
+            action = ACTION_ALLOW; // DNS rules are always allow rules
+        }
+    }
+    return action;
+}
+
+// __noinline; structs passed by pointer to stay under the arg-register limit.
+static __attribute__((noinline)) int evaluateClusterPolicyByLookUp(struct keystruct *trie_key, struct conntrack_key *flow_key,
+                                                         __u32 *admin_tier_priority,
+                                                         __u8 *baseline_tier_action,
+                                                         __u32 *baseline_tier_priority) {
+    __u32 admin_tier_action = ACTION_PASS;
+	*baseline_tier_action = ACTION_PASS;
+	*admin_tier_priority = MAX_RULE_PRIORITY;
+	*baseline_tier_priority = MAX_RULE_PRIORITY;
+
+	struct lpm_cp_trie_val *base = bpf_map_lookup_elem(&cp_egress_map, trie_key);
+
+	if (base == NULL) {
+		// No cluster policy rules exist, so we pass by default
+		return ACTION_PASS;
+	}
+
+	#pragma clang loop unroll(full)
+	for (int i = 0; i < MAX_PORT_PROTOCOL; i++){
+		struct lpm_cp_trie_val *trie_val = &base[i];
+
+		__u32 priority = trie_val->priority/10;
+		__u32 action = trie_val->priority%10;
+
+		if ((trie_val->protocol == ANY_IP_PROTOCOL) || (trie_val->protocol == flow_key->protocol &&
+					((trie_val->start_port == ANY_PORT) || (flow_key->dest_port == trie_val->start_port) ||
+						(trie_val->end_port > 0 && flow_key->dest_port >= trie_val->start_port && flow_key->dest_port <= trie_val->end_port)))) {
+			// Update admin tier
+			if (priority < *admin_tier_priority ||
+			(priority == *admin_tier_priority && action < admin_tier_action)) {
+				*admin_tier_priority = priority;
+				admin_tier_action = action;
+			}
+
+			// Update baseline tier
+			if (priority > ADMIN_TIER_PRIORITY_LIMIT &&
+				(priority < *baseline_tier_priority ||
+				(priority == *baseline_tier_priority && action < *baseline_tier_action))) {
+				*baseline_tier_priority = priority;
+				*baseline_tier_action = action;
+			}
+		}
+	}
+
+	return admin_tier_action;
+}
+
+// __noinline; structs passed by pointer.
+static __attribute__((noinline)) int evaluateNamespacePolicyByLookUp(struct keystruct *trie_key, struct conntrack_key *flow_key, int pod_state) {
+    struct lpm_trie_val *trie_val = bpf_map_lookup_elem(&egress_map, trie_key);
+
+    if (!trie_val) {
+        if (pod_state != POLICIES_APPLIED) {
+            return ACTION_PASS;
+        }
+        return ACTION_DENY;
+    }
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < MAX_PORT_PROTOCOL; i++) {
+        struct lpm_trie_val *rule = &trie_val[i];
+        if (rule->protocol == RESERVED_IP_PROTOCOL) {
+            return ACTION_DENY;
+        }
+        if (rule->protocol == 0) continue;
+
+        if ((rule->protocol == ANY_IP_PROTOCOL &&
+             ((rule->start_port == ANY_PORT) || (flow_key->dest_port == rule->start_port) ||
+              (flow_key->dest_port > rule->start_port && flow_key->dest_port <= rule->end_port))) ||
+            (rule->protocol == flow_key->protocol &&
+             ((rule->start_port == ANY_PORT) || (flow_key->dest_port == rule->start_port) ||
+              (flow_key->dest_port > rule->start_port && flow_key->dest_port <= rule->end_port)))) {
+            return ACTION_ALLOW;
+        }
+    }
+    return ACTION_DENY;
+}
+#else
 static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, __u32 *admin_tier_priority, __u8 *baseline_tier_action, __u32 *baseline_tier_priority) {
 
 	__u32 admin_tier_action = ACTION_PASS;
@@ -220,6 +372,7 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 	}
 	return ACTION_DENY;
 }
+#endif
 
 static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
 
@@ -229,6 +382,9 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
 		__u32 baseline_tier_priority;
+#ifdef ENABLE_DNS_POLICY
+		struct dns_cache_prio dns_prio;
+#endif
 		int effective_action;
 
 		// 1. Lookup Cluster Network Policy
@@ -249,10 +405,28 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		// 5. If baseline tier action is PASS, enforce default pod policy (DEFAULT_ALLOW or DEFAULT_DENY)
 
 		
+#ifdef ENABLE_DNS_POLICY
+		int admin_tier_action = evaluateClusterPolicyByLookUp(&trie_key, &flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
+		int ipcache_action = checkIPCache(flow_key.dest_ip, flow_key.dest_port, flow_key.protocol, &dns_prio);
+
+		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT || dns_prio.admin <= ADMIN_TIER_PRIORITY_LIMIT) {
+			// Enforce the lowest priority action. Deny always takes precedence on same priority
+			effective_action = admin_tier_action;
+			if (dns_prio.admin <= admin_tier_priority) {
+				if(dns_prio.admin == admin_tier_priority){
+					// For same priority, Deny overrides Allow overrides Pass. IP cache result is always Allow for DNS rules
+					effective_action = (admin_tier_action < ACTION_ALLOW) ? admin_tier_action : ipcache_action; 
+				}else {
+					effective_action = ipcache_action;
+				}
+			}
+
+#else
 		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
 		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT) {
 			// Enforce the lowest priority action. Deny always takes precedence on same priority
 			effective_action = admin_tier_action;
+#endif
 			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;
@@ -273,7 +447,16 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			}
 		}
 
+#ifdef ENABLE_DNS_POLICY
+		int verdict = evaluateNamespacePolicyByLookUp(&trie_key, &flow_key, pod_state);
+
+		// Enforce DNS rules at Namespace level only if there are rules defined at Namespace scoped policy level
+		if (dns_prio.ns == NETWORK_POLICY_TIER_PRIORITY) {
+			verdict = ipcache_action;
+		}
+#else
 		int verdict = evaluateNamespacePolicyByLookUp(trie_key, flow_key, pod_state);
+#endif
 
 		switch (verdict){
 		case ACTION_ALLOW:{
@@ -295,6 +478,17 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			// If no DNS rules and Baseline rules are defined (minimum_dns_cache_priority = baseline_tier_priority == MAX_RULE_PRIORITY), 
 			// effective action is baseline tier (PASS)
 			effective_action = baseline_tier_action;
+#ifdef ENABLE_DNS_POLICY
+			if ( dns_prio.baseline <= baseline_tier_priority && dns_prio.baseline < MAX_RULE_PRIORITY) {
+				if(dns_prio.baseline == baseline_tier_priority){
+					// For same priority, Deny overrides Allow overrides Pass. IP cache result is always Allow for DNS rules
+					effective_action = (baseline_tier_action < ACTION_ALLOW) ? baseline_tier_action : ipcache_action; 
+				} else {
+					effective_action = ipcache_action;
+				}
+			}
+
+#endif
 			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;

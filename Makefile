@@ -148,6 +148,7 @@ EBPF_SOURCE_INGRESS_TC := ./pkg/ebpf/c/tc.v4ingress.bpf.c
 EBPF_BINARY_INGRESS_TC := ./pkg/ebpf/c/tc.v4ingress.bpf.o
 EBPF_SOURCE_EGRESS_TC := ./pkg/ebpf/c/tc.v4egress.bpf.c
 EBPF_BINARY_EGRESS_TC := ./pkg/ebpf/c/tc.v4egress.bpf.o
+EBPF_BINARY_DNS_EGRESS_TC := ./pkg/ebpf/c/tc.v4egress.dns.bpf.o
 EBPF_SOURCE_V6_INGRESS_TC := ./pkg/ebpf/c/tc.v6ingress.bpf.c
 EBPF_BINARY_V6_INGRESS_TC := ./pkg/ebpf/c/tc.v6ingress.bpf.o
 EBPF_SOURCE_V6_EGRESS_TC := ./pkg/ebpf/c/tc.v6egress.bpf.c
@@ -162,6 +163,7 @@ build-bpf: ## Build BPF.
 	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_x86 -c $(EBPF_V6_EVENTS_SOURCE_TC) -o $(EBPF_V6_EVENTS_BINARY_TC)
 	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_INGRESS_TC) -o $(EBPF_BINARY_INGRESS_TC)
 	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_EGRESS_TC) -o $(EBPF_BINARY_EGRESS_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -DENABLE_DNS_POLICY -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_EGRESS_TC) -o $(EBPF_BINARY_DNS_EGRESS_TC)
 	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_INGRESS_TC) -o $(EBPF_BINARY_V6_INGRESS_TC)
 	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_EGRESS_TC) -o $(EBPF_BINARY_V6_EGRESS_TC)
 

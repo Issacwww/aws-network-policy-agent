@@ -155,6 +155,80 @@ func TestDeriveClusterPolicyEndpointDomainRules(t *testing.T) {
 	}
 }
 
+// An egress entry with neither a CIDR nor a domain name matches nothing. It is skipped whether or not
+// DNS policy is active, so it never reaches the firewall rule processor as an empty CIDR.
+func TestDeriveEgressRules_SkipsEntryWithoutCIDROrDomain(t *testing.T) {
+	protocolTCP := corev1.ProtocolTCP
+	var port443 int32 = 443
+	ports := []policyk8sawsv1.Port{{Protocol: &protocolTCP, Port: &port443}}
+	podIdentifier := "client@ns"
+
+	pe := &policyk8sawsv1.PolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "empty-peer-abcde", Namespace: "ns"},
+		Spec: policyk8sawsv1.PolicyEndpointSpec{
+			PodSelector:  &metav1.LabelSelector{},
+			PolicyRef:    policyk8sawsv1.PolicyReference{Name: "empty-peer", Namespace: "ns"},
+			PodIsolation: []networking.PolicyType{networking.PolicyTypeEgress},
+			Egress: []policyk8sawsv1.EndpointInfo{
+				{Ports: ports},
+				{CIDR: "10.0.0.0/8", Ports: ports},
+			},
+		},
+	}
+	cpe := &policyk8sawsv1.ClusterPolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "empty-peer-abcde"},
+		Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+			PolicyRef: policyk8sawsv1.ClusterPolicyReference{Name: "empty-peer"},
+			Tier:      policyk8sawsv1.AdminTier,
+			Priority:  20,
+			Egress: []policyk8sawsv1.ClusterEndpointInfo{
+				{Action: policyk8sawsv1.ClusterNetworkPolicyRuleActionAccept, Ports: ports},
+				{Action: policyk8sawsv1.ClusterNetworkPolicyRuleActionDeny, CIDR: "10.0.0.0/8"},
+			},
+		},
+	}
+
+	for _, tc := range []struct {
+		name         string
+		proxyManager proxymanager.ProxyManager
+	}{
+		{name: "DNS policy inactive", proxyManager: nil},
+		{name: "DNS policy active", proxyManager: &proxymanager.ProxyManagerMock{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockClient := mock_client.NewMockClient(ctrl)
+			mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+					switch endpoint := obj.(type) {
+					case *policyk8sawsv1.PolicyEndpoint:
+						*endpoint = *pe
+					case *policyk8sawsv1.ClusterPolicyEndpoint:
+						*endpoint = *cpe
+					}
+					return nil
+				},
+			).AnyTimes()
+
+			peReconciler := NewPolicyEndpointsReconciler(mockClient, "", &ebpf.MockBpfClient{}, false, tc.proxyManager)
+			peReconciler.podIdentifierToPolicyEndpointMap.Store(podIdentifier, []string{pe.Name})
+			_, egressRules, _, _, err := peReconciler.deriveIngressAndEgressFirewallRules(context.Background(), podIdentifier, pe.Namespace, pe.Name, false)
+			assert.NoError(t, err)
+			assert.Equal(t, []fwrp.EbpfFirewallRules{{IPCidr: "10.0.0.0/8", L4Info: ports}}, egressRules)
+
+			cpeReconciler := NewClusterPolicyEndpointsReconciler(mockClient, "", &ebpf.MockBpfClient{}, tc.proxyManager)
+			cpeReconciler.podIdentifierToClusterPolicyEndpointMap.Store(podIdentifier, []string{cpe.Name})
+			_, clusterEgressRules, err := cpeReconciler.deriveClusterPolicyIngressAndEgressFirewallRules(context.Background(), podIdentifier, cpe.Name, false)
+			assert.NoError(t, err)
+			assert.Equal(t, []fwrp.EbpfFirewallRules{{
+				Priority: 20,
+				Action:   policyk8sawsv1.ClusterNetworkPolicyRuleActionDeny,
+				IPCidr:   "10.0.0.0/8",
+			}}, clusterEgressRules)
+		})
+	}
+}
+
 func TestConfigureBPFProbes_DNSPolicyInactiveLeavesDomainStoreUntouched(t *testing.T) {
 	pod := npatypes.Pod{NamespacedName: types.NamespacedName{Name: "client", Namespace: "ns"}}
 	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
@@ -193,6 +267,8 @@ func TestCleanupClusterPolicyPod_LastPolicyRemovesDomainRules(t *testing.T) {
 	assert.NoError(t, r.cleanupClusterPolicyPod(context.Background(), pod, "guardrail-abcde", true))
 
 	assert.False(t, filter.HasClusterPolicyEndpointDomains(podIdentifier))
+	// an empty entry left in the store would still count as domain rules for the identifier
+	assert.False(t, filter.HasAnyDomainRules(podIdentifier))
 	assert.Equal(t, []types.NamespacedName{pod.NamespacedName}, proxy.removedPods)
 }
 
@@ -276,6 +352,7 @@ func TestCleanupPod_PolicyEndpointDomainRules(t *testing.T) {
 			assert.NoError(t, r.cleanupPod(context.Background(), targetPod, cleanedUpPE, true))
 
 			assert.Equal(t, tc.wantDomains, filter.HasPolicyEndpointDomains(podIdentifier))
+			assert.Equal(t, tc.wantDomains, filter.HasAnyDomainRules(podIdentifier))
 			if tc.wantDomains {
 				ipFilter, ok := filter.GetIPFilter(podIdentifier)
 				assert.True(t, ok)

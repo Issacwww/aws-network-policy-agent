@@ -216,26 +216,35 @@ func TestEnforceNpToPod_FailsClosedOnPodStateError(t *testing.T) {
 	assert.Nil(t, resp, "rpc must not return a success reply when the pod-state write fails")
 }
 
-// recordingProxy records the pods whose DNS redirection is force-removed.
+// recordingProxy records the pods whose DNS redirection is force-removed; the removal fails with err when set.
 type recordingProxy struct {
 	proxymanager.ProxyManagerMock
 	removedPods []types.NamespacedName
+	err         error
 }
 
 func (p *recordingProxy) ForceRemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error {
 	p.removedPods = append(p.removedPods, pod)
-	return nil
+	return p.err
 }
 
 func TestDeletePodNp_DNSPolicy(t *testing.T) {
 	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
+	removalErr := errors.New("simulated nftables failure")
 	for _, tc := range []struct {
 		name         string
 		proxy        *recordingProxy
 		wantRemovals []types.NamespacedName
+		wantErr      error
 	}{
 		{name: "DNS policy inactive", proxy: nil},
 		{name: "DNS policy active removes the pod's DNS redirection", proxy: &recordingProxy{}, wantRemovals: []types.NamespacedName{pod}},
+		{
+			name:         "a failed DNS redirection removal fails the request",
+			proxy:        &recordingProxy{err: removalErr},
+			wantRemovals: []types.NamespacedName{pod},
+			wantErr:      removalErr,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mockBpfClient := &ebpf.MockBpfClient{}
@@ -245,8 +254,13 @@ func TestDeletePodNp_DNSPolicy(t *testing.T) {
 			}
 
 			resp, err := s.DeletePodNp(context.Background(), &rpc.DeleteNpRequest{K8S_POD_NAME: pod.Name, K8S_POD_NAMESPACE: pod.Namespace})
-			assert.NoError(t, err)
-			assert.True(t, resp.Success)
+			if tc.wantErr != nil {
+				assert.ErrorIs(t, err, tc.wantErr)
+				assert.False(t, resp.Success)
+			} else {
+				assert.NoError(t, err)
+				assert.True(t, resp.Success)
+			}
 			assert.Equal(t, []string{"DeleteBPFProbes"}, mockBpfClient.CallLog)
 			if tc.proxy != nil {
 				assert.Equal(t, tc.wantRemovals, tc.proxy.removedPods)

@@ -105,7 +105,6 @@ struct data_t {
 	__u8 tier;
 };
 
-#ifdef ENABLE_DNS_POLICY
 struct ipcache_key {
 	__u32 ip;
 };
@@ -123,7 +122,6 @@ struct bpf_map_def_pvt SEC("maps") ipcache_map = {
 	.pinning = PIN_GLOBAL_NS,
 };
 
-#endif
 struct bpf_map_def_pvt SEC("maps") cp_egress_map = {
 	.type = BPF_MAP_TYPE_LPM_TRIE,
 	.key_size = sizeof(struct lpm_trie_key),
@@ -158,7 +156,6 @@ struct bpf_map_def_pvt SEC("maps") egress_pod_state_map = {
 struct bpf_map_def_pvt aws_conntrack_map;
 struct bpf_map_def_pvt policy_events;
 
-#ifdef ENABLE_DNS_POLICY
 // DNS cache priorities per tier, packed to keep checkIPCache under the arg limit.
 struct dns_cache_prio {
     __u32 admin;
@@ -290,89 +287,6 @@ static __attribute__((noinline)) int evaluateNamespacePolicyByLookUp(struct keys
     }
     return ACTION_DENY;
 }
-#else
-static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, __u32 *admin_tier_priority, __u8 *baseline_tier_action, __u32 *baseline_tier_priority) {
-
-	__u32 admin_tier_action = ACTION_PASS;
-	*baseline_tier_action = ACTION_PASS;
-	*admin_tier_priority = MAX_RULE_PRIORITY;
-	*baseline_tier_priority = MAX_RULE_PRIORITY;
-
-	struct lpm_cp_trie_val *trie_val = bpf_map_lookup_elem(&cp_egress_map, &trie_key);
-
-	if (trie_val == NULL) {
-		// No cluster policy rules exist, so we pass by default
-		return ACTION_PASS;
-	}
-
-	for (int i = 0; i < MAX_PORT_PROTOCOL; i++, trie_val++){
-
-		__u32 priority = trie_val->priority/10;
-		__u32 action = trie_val->priority%10;
-
-		if ((trie_val->protocol == ANY_IP_PROTOCOL) || (trie_val->protocol == flow_key.protocol &&
-					((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) ||
-						(trie_val->end_port > 0 && flow_key.dest_port >= trie_val->start_port && flow_key.dest_port <= trie_val->end_port)))) {
-			// Update admin tier
-			if (priority < *admin_tier_priority || 
-			(priority == *admin_tier_priority && action < admin_tier_action)) {
-				*admin_tier_priority = priority;
-				admin_tier_action = action;
-			}
-
-			// Update baseline tier
-			if (priority > ADMIN_TIER_PRIORITY_LIMIT &&
-				(priority < *baseline_tier_priority ||
-				(priority == *baseline_tier_priority && action < *baseline_tier_action))) {
-				*baseline_tier_priority = priority;
-				*baseline_tier_action = action;
-			}
-		}
-	}
-
-	return admin_tier_action;
-}
-
-static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, int pod_state) {
-	//Check if it's in the allowed list
-	struct lpm_trie_val *trie_val = bpf_map_lookup_elem(&egress_map, &trie_key);
-
-	if (trie_val == NULL) {
-		if (pod_state != POLICIES_APPLIED) {
-			// No namespace policy rules exist, so we pass to baseline rules. The pod is in default-allow or default-deny state
-			return ACTION_PASS;
-		}
-		return ACTION_DENY;
-	}
-
-	for (int i = 0; i < MAX_PORT_PROTOCOL; i++, trie_val++){
-		if (trie_val->protocol == RESERVED_IP_PROTOCOL) {
-			return ACTION_DENY;
-		}
-		
-		// 1. ANY_IP_PROTOCOL:
-		//    - If the rule specifies ANY_IP_PROTOCOL (i.e., applies to all L4 protocols),
-		//    - Then match if:
-		//        - start_port is ANY_PORT → rule applies to all ports
-		//        - OR l4_dst_port is exactly the start_port
-		//        - OR l4_dst_port falls within (start_port, end_port] range
-		//
-		// 2. Specific Protocol Match:
-		//    - If trie_val->protocol matches the packet's IP protocol (e.g., TCP or UDP),
-		//    - Then apply the same port match logic as above.
-
-		if ((trie_val->protocol == ANY_IP_PROTOCOL && 
-			((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) ||
-			(flow_key.dest_port > trie_val->start_port && flow_key.dest_port <= trie_val->end_port))) || 
-			(trie_val->protocol == flow_key.protocol &&
-			((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) ||
-			(flow_key.dest_port > trie_val->start_port && flow_key.dest_port <= trie_val->end_port)))) {
-			return ACTION_ALLOW;
-		}
-	}
-	return ACTION_DENY;
-}
-#endif
 
 static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
 
@@ -382,9 +296,7 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
 		__u32 baseline_tier_priority;
-#ifdef ENABLE_DNS_POLICY
 		struct dns_cache_prio dns_prio;
-#endif
 		int effective_action;
 
 		// 1. Lookup Cluster Network Policy
@@ -405,7 +317,6 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		// 5. If baseline tier action is PASS, enforce default pod policy (DEFAULT_ALLOW or DEFAULT_DENY)
 
 		
-#ifdef ENABLE_DNS_POLICY
 		int admin_tier_action = evaluateClusterPolicyByLookUp(&trie_key, &flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
 		int ipcache_action = checkIPCache(flow_key.dest_ip, flow_key.dest_port, flow_key.protocol, &dns_prio);
 
@@ -421,12 +332,6 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 				}
 			}
 
-#else
-		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
-		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT) {
-			// Enforce the lowest priority action. Deny always takes precedence on same priority
-			effective_action = admin_tier_action;
-#endif
 			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;
@@ -447,16 +352,12 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			}
 		}
 
-#ifdef ENABLE_DNS_POLICY
 		int verdict = evaluateNamespacePolicyByLookUp(&trie_key, &flow_key, pod_state);
 
 		// Enforce DNS rules at Namespace level only if there are rules defined at Namespace scoped policy level
 		if (dns_prio.ns == NETWORK_POLICY_TIER_PRIORITY) {
 			verdict = ipcache_action;
 		}
-#else
-		int verdict = evaluateNamespacePolicyByLookUp(trie_key, flow_key, pod_state);
-#endif
 
 		switch (verdict){
 		case ACTION_ALLOW:{
@@ -478,7 +379,6 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			// If no DNS rules and Baseline rules are defined (minimum_dns_cache_priority = baseline_tier_priority == MAX_RULE_PRIORITY), 
 			// effective action is baseline tier (PASS)
 			effective_action = baseline_tier_action;
-#ifdef ENABLE_DNS_POLICY
 			if ( dns_prio.baseline <= baseline_tier_priority && dns_prio.baseline < MAX_RULE_PRIORITY) {
 				if(dns_prio.baseline == baseline_tier_priority){
 					// For same priority, Deny overrides Allow overrides Pass. IP cache result is always Allow for DNS rules
@@ -488,7 +388,6 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 				}
 			}
 
-#endif
 			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;

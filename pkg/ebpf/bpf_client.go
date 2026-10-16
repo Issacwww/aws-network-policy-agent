@@ -37,7 +37,6 @@ import (
 var (
 	TC_INGRESS_BINARY                                = "tc.v4ingress.bpf.o"
 	TC_EGRESS_BINARY                                 = "tc.v4egress.bpf.o"
-	TC_DNS_EGRESS_BINARY                             = "tc.v4egress.dns.bpf.o"
 	TC_V6_INGRESS_BINARY                             = "tc.v6ingress.bpf.o"
 	TC_V6_EGRESS_BINARY                              = "tc.v6egress.bpf.o"
 	EVENTS_BINARY                                    = "v4events.bpf.o"
@@ -151,8 +150,7 @@ type BPFContext struct {
 }
 
 func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs bool,
-	enableIPv6 bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string,
-	enableDNSPolicy bool) (*bpfClient, error) {
+	enableIPv6 bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string) (*bpfClient, error) {
 	var conntrackMap goebpfmaps.BpfMap
 
 	ebpfClient := &bpfClient{
@@ -179,10 +177,6 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 	if enableIPv6 {
 		ingressBinary, egressBinary, eventsBinary,
 			cliBinary, hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, EKS_V6_CLI_BINARY, IPv6_HOST_MASK
-	} else if enableDNSPolicy {
-		// DNS policy needs the egress program built with the per-pod ipcache map. It is installed on the
-		// host under the regular egress binary name, so toggling the flag reloads the egress probes.
-		egressBinary = TC_DNS_EGRESS_BINARY
 	}
 	ebpfClient.ingressBinary, ebpfClient.egressBinary,
 		ebpfClient.hostMask = ingressBinary, egressBinary, hostMask
@@ -394,7 +388,7 @@ func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostB
 			log().Errorf("error opening Probe: %s error: %v", bpfProbe, err)
 		}
 
-		existingProbePath = hostBinaryPath + hostBinaryName(bpfProbe)
+		existingProbePath = hostBinaryPath + bpfProbe
 		existingProbe, err := os.ReadFile(existingProbePath)
 		if err != nil {
 			log().Errorf("error opening Probe: %s error: %v", existingProbePath, err)
@@ -415,21 +409,13 @@ func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostB
 				log().Info("change detected in ingress probe binaries.. ")
 				updateIngressProbe = true
 			}
-			if bpfProbe == TC_EGRESS_BINARY || bpfProbe == TC_DNS_EGRESS_BINARY || bpfProbe == TC_V6_EGRESS_BINARY {
+			if bpfProbe == TC_EGRESS_BINARY || bpfProbe == TC_V6_EGRESS_BINARY {
 				log().Info("change detected in egress probe binaries..")
 				updateEgressProbe = true
 			}
 		}
 	}
 	return updateIngressProbe, updateEgressProbe, updateEventsProbe, nil
-}
-
-// hostBinaryName returns the name a packaged BPF binary is installed under on the host.
-func hostBinaryName(binary string) string {
-	if binary == TC_DNS_EGRESS_BINARY {
-		return TC_EGRESS_BINARY
-	}
-	return binary
 }
 
 func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.BpfSDKClient, policyEndpointeBPFContext *sync.Map, globalMaps *sync.Map, updateIngressProbe,

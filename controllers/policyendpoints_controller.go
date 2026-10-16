@@ -106,7 +106,7 @@ func prometheusRegister() {
 }
 
 // NewPolicyEndpointsReconciler constructs new PolicyEndpointReconciler.
-// A nil proxyManager disables DNS policy: domain egress rules are skipped as before.
+// A nil proxyManager (IPv6 clusters) disables DNS policy: domain egress rules are skipped as before.
 func NewPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, enableIPv6 bool, proxyManager proxymanager.ProxyManager) *PolicyEndpointsReconciler {
 	r := &PolicyEndpointsReconciler{
 		k8sClient:        k8sClient,

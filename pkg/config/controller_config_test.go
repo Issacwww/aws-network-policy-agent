@@ -18,7 +18,6 @@ func parseFlags(t *testing.T, args ...string) ControllerConfig {
 
 func TestDNSPolicyFlagDefaults(t *testing.T) {
 	cfg := parseFlags(t)
-	assert.False(t, cfg.EnableDNSPolicy)
 	assert.Equal(t, "kube-dns", cfg.DNSPolicyUpstreamSource)
 	assert.Equal(t, -110, cfg.DNSPolicyNftPriority)
 	assert.NoError(t, cfg.ValidControllerFlags())
@@ -31,12 +30,12 @@ func TestDNSPolicyFlagValidation(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "EC2 defaults with DNS policy enabled",
-			args: []string{"--enable-dns-policy=true"},
+			name: "EC2 defaults",
+			args: []string{},
 		},
 		{
 			name: "Auto Mode values",
-			args: []string{"--enable-dns-policy=true", "--dns-policy-upstream-source=bottlerocket", "--dns-policy-nft-priority=-100"},
+			args: []string{"--dns-policy-upstream-source=bottlerocket", "--dns-policy-nft-priority=-100"},
 		},
 		{
 			name:    "unknown upstream source",
@@ -49,12 +48,7 @@ func TestDNSPolicyFlagValidation(t *testing.T) {
 			wantErr: "Invalid DNS policy nft priority -150",
 		},
 		{
-			name:    "IPv6 with DNS policy",
-			args:    []string{"--enable-dns-policy=true", "--enable-ipv6=true"},
-			wantErr: "DNS policy supports IPv4 only",
-		},
-		{
-			name: "IPv6 without DNS policy",
+			name: "IPv6 cluster",
 			args: []string{"--enable-ipv6=true"},
 		},
 	}

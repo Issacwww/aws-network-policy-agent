@@ -30,7 +30,6 @@ const (
 	flagConntrackCacheCleanupPeriod    = "conntrack-cache-cleanup-period"
 	flagConntrackCacheTableSize        = "conntrack-cache-table-size"
 	flagEnableProfiling                = "enable-profiling"
-	flagEnableDNSPolicy                = "enable-dns-policy"
 	flagDNSPolicyUpstreamSource        = "dns-policy-upstream-source"
 	flagDNSPolicyNftPriority           = "dns-policy-nft-priority"
 	// DNSPolicyNftPriorityEC2 places the DNS redirect DNAT ahead of kube-proxy's Service DNAT (-100),
@@ -68,8 +67,6 @@ type ControllerConfig struct {
 	RuntimeConfig RuntimeConfig
 	// Configuration for enabling profiling
 	EnableProfiling bool
-	// Enable domain-based (DNS) egress policy
-	EnableDNSPolicy bool
 	// DNSPolicyUpstreamSource selects where the DNS proxy upstream comes from: discovery.UpstreamSourceKubeDNS
 	// or discovery.UpstreamSourceBottlerocket
 	DNSPolicyUpstreamSource string
@@ -93,7 +90,6 @@ func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&cfg.EnableIPv6, flagEnableIPv6, false, "If enabled, Network Policy agent will operate in IPv6 mode")
 	fs.BoolVar(&cfg.EnableNetworkPolicy, flagEnableNetworkPolicy, false, "If enabled, Network Policy agent will initialize BPF maps and start reconciler")
 	fs.BoolVar(&cfg.EnableProfiling, flagEnableProfiling, false, "If enabled, Network Policy agent will enable profiling")
-	fs.BoolVar(&cfg.EnableDNSPolicy, flagEnableDNSPolicy, false, "If enabled, Network Policy agent will enforce domain names in egress policy rules (IPv4 only)")
 	fs.StringVar(&cfg.DNSPolicyUpstreamSource, flagDNSPolicyUpstreamSource, discovery.UpstreamSourceKubeDNS, ""+
 		"Upstream DNS server for the DNS policy proxy - kube-dns (kube-dns Service IP) or bottlerocket (Bottlerocket settings)")
 	fs.IntVar(&cfg.DNSPolicyNftPriority, flagDNSPolicyNftPriority, DNSPolicyNftPriorityEC2, ""+
@@ -119,9 +115,6 @@ func (cfg *ControllerConfig) ValidControllerFlags() error {
 	if cfg.DNSPolicyNftPriority != DNSPolicyNftPriorityEC2 && cfg.DNSPolicyNftPriority != DNSPolicyNftPriorityAuto {
 		return fmt.Errorf("Invalid DNS policy nft priority %d, should be %d or %d", cfg.DNSPolicyNftPriority,
 			DNSPolicyNftPriorityEC2, DNSPolicyNftPriorityAuto)
-	}
-	if cfg.EnableDNSPolicy && cfg.EnableIPv6 {
-		return errors.New("DNS policy supports IPv4 only, disable enable-dns-policy or enable-ipv6")
 	}
 	return nil
 }

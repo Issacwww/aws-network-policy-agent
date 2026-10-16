@@ -21,8 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// These tests pin the --enable-dns-policy gate: a nil proxy manager (flag off) keeps the
-// pre-DNS-policy handling of domainName entries, a proxy manager (flag on) uses Auto's.
+// These tests pin when DNS policy applies: with a proxy manager (IPv4 clusters) the controllers use
+// Auto's handling of domainName entries; with a nil proxy manager (IPv6 clusters, where DNS policy is
+// not supported yet) they keep skipping domainName entries as before DNS policy support.
 
 func domainPolicyEndpoint() *policyk8sawsv1.PolicyEndpoint {
 	protocolTCP := corev1.ProtocolTCP
@@ -43,7 +44,7 @@ func domainPolicyEndpoint() *policyk8sawsv1.PolicyEndpoint {
 	}
 }
 
-func TestDerivePolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
+func TestDerivePolicyEndpointDomainRules(t *testing.T) {
 	pe := domainPolicyEndpoint()
 	podIdentifier := "client@ns"
 
@@ -54,13 +55,13 @@ func TestDerivePolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
 		wantEgressIsolated bool
 	}{
 		{
-			name:               "flag off skips the domain entry and isolates egress",
+			name:               "DNS policy inactive skips the domain entry and isolates egress",
 			proxyManager:       nil,
 			wantEgressRules:    nil,
 			wantEgressIsolated: true,
 		},
 		{
-			name:         "flag on adds the domain entry as a namespace tier rule",
+			name:         "DNS policy active adds the domain entry as a namespace tier rule",
 			proxyManager: &proxymanager.ProxyManagerMock{},
 			wantEgressRules: []fwrp.EbpfFirewallRules{{
 				Priority:   utils.PE_PRIORITY*10 + 1,
@@ -91,7 +92,7 @@ func TestDerivePolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
 	}
 }
 
-func TestDeriveClusterPolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
+func TestDeriveClusterPolicyEndpointDomainRules(t *testing.T) {
 	protocolTCP := corev1.ProtocolTCP
 	var port443 int32 = 443
 	cpe := &policyk8sawsv1.ClusterPolicyEndpoint{
@@ -117,12 +118,12 @@ func TestDeriveClusterPolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
 		wantEgressRules []fwrp.EbpfFirewallRules
 	}{
 		{
-			name:            "flag off skips the domain entry",
+			name:            "DNS policy inactive skips the domain entry",
 			proxyManager:    nil,
 			wantEgressRules: nil,
 		},
 		{
-			name:         "flag on keeps the domain entry with the policy priority",
+			name:         "DNS policy active keeps the domain entry with the policy priority",
 			proxyManager: &proxymanager.ProxyManagerMock{},
 			wantEgressRules: []fwrp.EbpfFirewallRules{{
 				Priority:   20,
@@ -154,7 +155,7 @@ func TestDeriveClusterPolicyEndpointDomainRules_DNSPolicyFlag(t *testing.T) {
 	}
 }
 
-func TestConfigureBPFProbes_DNSPolicyFlagOffLeavesDomainStoreUntouched(t *testing.T) {
+func TestConfigureBPFProbes_DNSPolicyInactiveLeavesDomainStoreUntouched(t *testing.T) {
 	pod := npatypes.Pod{NamespacedName: types.NamespacedName{Name: "client", Namespace: "ns"}}
 	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
 	egressRules := []fwrp.EbpfFirewallRules{{IPCidr: "10.0.0.0/8"}}

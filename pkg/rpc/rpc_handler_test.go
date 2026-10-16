@@ -234,8 +234,8 @@ func TestDeletePodNp_DNSPolicy(t *testing.T) {
 		proxy        *recordingProxy
 		wantRemovals []types.NamespacedName
 	}{
-		{name: "DNS policy disabled", proxy: nil},
-		{name: "DNS policy enabled removes the pod's DNS redirection", proxy: &recordingProxy{}, wantRemovals: []types.NamespacedName{pod}},
+		{name: "DNS policy inactive", proxy: nil},
+		{name: "DNS policy active removes the pod's DNS redirection", proxy: &recordingProxy{}, wantRemovals: []types.NamespacedName{pod}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mockBpfClient := &ebpf.MockBpfClient{}

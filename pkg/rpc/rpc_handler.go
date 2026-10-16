@@ -46,7 +46,7 @@ const (
 type server struct {
 	policyReconciler        *controllers.PolicyEndpointsReconciler
 	clusterPolicyReconciler *controllers.ClusterPolicyEndpointsReconciler
-	// nil when DNS policy is disabled
+	// nil on IPv6 clusters, where DNS policy is not supported
 	proxymanager proxymanager.ProxyManager
 	rpc.UnimplementedNPBackendServer
 }

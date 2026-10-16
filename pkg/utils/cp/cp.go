@@ -9,10 +9,8 @@ import (
 )
 
 var (
-	EKS_CLI_BINARY       = "aws-eks-na-cli"
-	EKS_V6_CLI_BINARY    = "aws-eks-na-cli-v6"
-	TC_EGRESS_BINARY     = "tc.v4egress.bpf.o"
-	TC_DNS_EGRESS_BINARY = "tc.v4egress.dns.bpf.o"
+	EKS_CLI_BINARY    = "aws-eks-na-cli"
+	EKS_V6_CLI_BINARY = "aws-eks-na-cli-v6"
 )
 
 func log() logger.Logger {
@@ -75,10 +73,6 @@ func InstallBPFBinaries(pluginBins []string, hostCNIBinPath string) error {
 		// CLI binary should always refer to aws-eks-na-cli
 		if plugin == EKS_V6_CLI_BINARY {
 			targetPlugin = EKS_CLI_BINARY
-		}
-		// The DNS policy egress binary replaces the regular egress binary on the host
-		if plugin == TC_DNS_EGRESS_BINARY {
-			targetPlugin = TC_EGRESS_BINARY
 		}
 
 		target := fmt.Sprintf("%s%s", hostCNIBinPath, targetPlugin)

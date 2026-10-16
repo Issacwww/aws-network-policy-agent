@@ -54,7 +54,6 @@ COPY --from=builder /workspace/aws-eks-na-cli .
 COPY --from=builder /workspace/aws-eks-na-cli-v6 .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v4ingress.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v4egress.bpf.o .
-COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v4egress.dns.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v6ingress.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v6egress.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/v4events.bpf.o .

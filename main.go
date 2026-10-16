@@ -124,7 +124,7 @@ func main() {
 
 	var policyEndpointController *controllers.PolicyEndpointsReconciler
 	var clusterPolicyEndpointController *controllers.ClusterPolicyEndpointsReconciler
-	// proxyManager stays nil unless DNS policy is enabled
+	// proxyManager stays nil on IPv6 clusters, where DNS policy is not supported
 	var proxyManager proxymanager.ProxyManager
 	if ctrlConfig.EnableNetworkPolicy {
 		log.Info("Network Policy is enabled, registering controllers...")
@@ -138,22 +138,26 @@ func main() {
 
 		npMode, isMultiNICEnabled := lo.Must2(getNetworkPolicyConfigsFromIpamd(ctx, log))
 
+		// DNS policy (domainName egress rules) is IPv4 only for now. On IPv6 clusters proxyManager stays nil
+		// and the controllers skip domainName entries, as before DNS policy support.
+		enableDNSPolicy := !ctrlConfig.EnableIPv6
 		var upstreamIP net.IP
-		if ctrlConfig.EnableDNSPolicy {
+		if enableDNSPolicy {
 			upstreamIP, err = dnsDiscovery.GetUpstreamDNSIP(ctrlConfig.DNSPolicyUpstreamSource)
 			if err != nil {
-				log.Errorf("DNS policy is enabled but the upstream DNS server could not be discovered (source %s): %v",
+				log.Errorf("DNS policy upstream DNS server could not be discovered (source %s): %v",
 					ctrlConfig.DNSPolicyUpstreamSource, err)
 				os.Exit(1)
 			}
+		} else {
+			log.Info("DNS policy is not supported on IPv6 clusters, domainName egress rules are ignored")
 		}
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
-			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel,
-			ctrlConfig.EnableDNSPolicy))
+			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
 		ebpfClient.ReAttachEbpfProbes()
 
-		if ctrlConfig.EnableDNSPolicy {
+		if enableDNSPolicy {
 			filter.BpfClient = ebpfClient
 			filter.IsIPv6 = ctrlConfig.EnableIPv6
 

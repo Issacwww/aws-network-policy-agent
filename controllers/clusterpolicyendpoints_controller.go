@@ -65,7 +65,7 @@ func clusterPolicyPrometheusRegister() {
 }
 
 // NewClusterPolicyEndpointsReconciler constructs new ClusterPolicyEndpointReconciler.
-// A nil proxyManager disables DNS policy: domain egress rules are skipped as before.
+// A nil proxyManager (IPv6 clusters) disables DNS policy: domain egress rules are skipped as before.
 func NewClusterPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, proxyManager proxymanager.ProxyManager) *ClusterPolicyEndpointsReconciler {
 	r := &ClusterPolicyEndpointsReconciler{
 		k8sClient:        k8sClient,
@@ -539,7 +539,7 @@ func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.C
 }
 
 // updateClusterPolicyDomainRules applies the cluster policy domain rules left for podIdentifier after a
-// cleanup, and removes the pod's DNS redirection once none are left. No-op when DNS policy is disabled.
+// cleanup, and removes the pod's DNS redirection once none are left. No-op when DNS policy is not active.
 func (r *ClusterPolicyEndpointsReconciler) updateClusterPolicyDomainRules(targetPod npatypes.Pod, podIdentifier string, clusterPolicyDomainRules []fwrp.EbpfFirewallRules) {
 	if r.proxyManager == nil {
 		return

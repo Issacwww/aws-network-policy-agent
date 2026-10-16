@@ -854,6 +854,19 @@ func TestFWRuleProcessor_ComputeClusterPolicyMapEntriesFromEndpointRules_IPv6_No
 	}
 }
 
+func TestComputeClusterPolicyMapEntriesIgnoresDomainOnlyRules(t *testing.T) {
+	processor := NewFirewallRuleProcessor("192.0.2.10", "/32", false)
+	rules := []EbpfFirewallRules{{
+		DomainName: "api.example.com",
+		Action:     "Accept",
+		Priority:   50,
+	}}
+
+	got, err := processor.ComputeClusterPolicyMapEntriesFromEndpointRules(rules)
+	assert.NoError(t, err)
+	assert.Len(t, got, 1, "only the mandatory node-IP entry should remain")
+}
+
 // maxPrefixLenForFamily returns the largest legal prefix length for the
 // cluster's address family (32 for IPv4 keys, 128 for IPv6 keys).
 func maxPrefixLenForFamily(enableIPv6 bool) uint32 {

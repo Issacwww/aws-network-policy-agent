@@ -105,6 +105,23 @@ struct data_t {
 	__u8 tier;
 };
 
+struct ipcache_key {
+	struct in6_addr ip;
+};
+
+struct ipcache_value {
+	__u64 expiry_time;
+	struct lpm_cp_trie_val ports[MAX_PORT_PROTOCOL];
+};
+
+struct bpf_map_def_pvt SEC("maps") ipcache_map = {
+	.type = BPF_MAP_TYPE_LRU_HASH,
+	.key_size = sizeof(struct ipcache_key),
+	.value_size = sizeof(struct ipcache_value),
+	.max_entries = 65536,
+	.pinning = PIN_GLOBAL_NS,
+};
+
 struct bpf_map_def_pvt SEC("maps") cp_egress_map = {
 	.type = BPF_MAP_TYPE_LPM_TRIE,
 	.key_size = sizeof(struct lpm_trie_key),
@@ -139,28 +156,81 @@ struct bpf_map_def_pvt SEC("maps") egress_pod_state_map = {
 struct bpf_map_def_pvt aws_conntrack_map;
 struct bpf_map_def_pvt policy_events;
 
-static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, __u32 *admin_tier_priority, __u8 *baseline_tier_action, __u32 *baseline_tier_priority) {
+struct dns_cache_priority {
+	__u32 admin;
+	__u32 namespace;
+	__u32 baseline;
+};
+
+static __attribute__((noinline)) int checkIPCache(const struct in6_addr *dest_ip,
+						  __u16 dest_port,
+						  __u8 protocol,
+						  struct dns_cache_priority *priority) {
+	struct ipcache_key cache_key = {.ip = *dest_ip};
+	priority->admin = MAX_RULE_PRIORITY;
+	priority->namespace = MAX_RULE_PRIORITY;
+	priority->baseline = MAX_RULE_PRIORITY;
+
+	struct ipcache_value *cache_value = bpf_map_lookup_elem(&ipcache_map, &cache_key);
+	if (cache_value == NULL || cache_value->expiry_time < bpf_ktime_get_ns()) {
+		return ACTION_PASS;
+	}
+
+	int action = ACTION_PASS;
+#pragma clang loop unroll(full)
+	for (int i = 0; i < MAX_PORT_PROTOCOL; i++) {
+		struct lpm_cp_trie_val *port_entry = &cache_value->ports[i];
+		if (port_entry->protocol == 0) {
+			continue;
+		}
+		if ((port_entry->protocol == ANY_IP_PROTOCOL || port_entry->protocol == protocol) &&
+		    (port_entry->start_port == ANY_PORT || dest_port == port_entry->start_port ||
+		     (port_entry->end_port > 0 && dest_port > port_entry->start_port &&
+		      dest_port <= port_entry->end_port))) {
+			__u32 encoded_priority = port_entry->priority / 10;
+			if (encoded_priority < priority->admin) {
+				priority->admin = encoded_priority;
+			}
+			if (encoded_priority == NETWORK_POLICY_TIER_PRIORITY) {
+				priority->namespace = encoded_priority;
+			}
+			if (encoded_priority > NETWORK_POLICY_TIER_PRIORITY &&
+			    encoded_priority < priority->baseline) {
+				priority->baseline = encoded_priority;
+			}
+			action = ACTION_ALLOW;
+		}
+	}
+	return action;
+}
+
+static __attribute__((noinline)) int evaluateClusterPolicyByLookUp(struct keystruct *trie_key,
+							   struct conntrack_key *flow_key,
+							   __u32 *admin_tier_priority,
+							   __u8 *baseline_tier_action,
+							   __u32 *baseline_tier_priority) {
 
 	__u32 admin_tier_action = ACTION_PASS;
 	*baseline_tier_action = ACTION_PASS;
 	*admin_tier_priority = MAX_RULE_PRIORITY;
 	*baseline_tier_priority = MAX_RULE_PRIORITY;
 
-	struct lpm_cp_trie_val *trie_val = bpf_map_lookup_elem(&cp_egress_map, &trie_key);
+	struct lpm_cp_trie_val *trie_val = bpf_map_lookup_elem(&cp_egress_map, trie_key);
 
 	if (trie_val == NULL) {
 		// No cluster policy rules exist, so we pass by default
 		return ACTION_PASS;
 	}
 
+#pragma clang loop unroll(full)
 	for (int i = 0; i < MAX_PORT_PROTOCOL; i++, trie_val++){
 
 		__u32 priority = trie_val->priority/10;
 		__u32 action = trie_val->priority%10;
 
-		if ((trie_val->protocol == ANY_IP_PROTOCOL) || (trie_val->protocol == flow_key.protocol &&
-					((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) ||
-						(trie_val->end_port > 0 && flow_key.dest_port >= trie_val->start_port && flow_key.dest_port <= trie_val->end_port)))) {
+		if ((trie_val->protocol == ANY_IP_PROTOCOL) || (trie_val->protocol == flow_key->protocol &&
+					((trie_val->start_port == ANY_PORT) || (flow_key->dest_port == trie_val->start_port) ||
+						(trie_val->end_port > 0 && flow_key->dest_port >= trie_val->start_port && flow_key->dest_port <= trie_val->end_port)))) {
 			// Update admin tier
 			if (priority < *admin_tier_priority || 
 			(priority == *admin_tier_priority && action < admin_tier_action)) {
@@ -181,10 +251,12 @@ static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_k
 	return admin_tier_action;
 }
 
-static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, int pod_state) {
+static __attribute__((noinline)) int evaluateNamespacePolicyByLookUp(struct keystruct *trie_key,
+							    struct conntrack_key *flow_key,
+							    int pod_state) {
 
 	//Check if it's in the allowed list
-	struct lpm_trie_val *trie_val = bpf_map_lookup_elem(&egress_map, &trie_key);
+	struct lpm_trie_val *trie_val = bpf_map_lookup_elem(&egress_map, trie_key);
 	if (trie_val == NULL) {
 		if (pod_state != POLICIES_APPLIED) {
 			// No namespace policy rules exist, so we pass to baseline
@@ -193,6 +265,7 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 		return ACTION_DENY;
 	}
 
+#pragma clang loop unroll(full)
 	for (int i = 0; i < MAX_PORT_PROTOCOL; i++, trie_val++){
 		if (trie_val->protocol == RESERVED_IP_PROTOCOL) {
 			return ACTION_DENY;
@@ -210,11 +283,11 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 		//    - Then apply the same port match logic as above.
 
 		if ((trie_val->protocol == ANY_IP_PROTOCOL &&
-			((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) ||
-			(flow_key.dest_port > trie_val->start_port && flow_key.dest_port <= trie_val->end_port))) ||
-			(trie_val->protocol == flow_key.protocol &&
-			((trie_val->start_port == ANY_PORT) || (flow_key.dest_port == trie_val->start_port) || 
-			(flow_key.dest_port > trie_val->start_port && flow_key.dest_port <= trie_val->end_port)))) {
+			((trie_val->start_port == ANY_PORT) || (flow_key->dest_port == trie_val->start_port) ||
+			(flow_key->dest_port > trie_val->start_port && flow_key->dest_port <= trie_val->end_port))) ||
+			(trie_val->protocol == flow_key->protocol &&
+			((trie_val->start_port == ANY_PORT) || (flow_key->dest_port == trie_val->start_port) ||
+			(flow_key->dest_port > trie_val->start_port && flow_key->dest_port <= trie_val->end_port)))) {
 			return ACTION_ALLOW;
 		}
 	}
@@ -222,7 +295,11 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 	return ACTION_DENY;
 }
 
-static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
+static __attribute__((noinline)) int evaluateFlow(struct keystruct *trie_key,
+						  struct conntrack_key *flow_key,
+						  __u8 pod_state_val,
+						  struct data_t *evt,
+						  int pod_state) {
 
 		struct conntrack_value flow_val = {};
 		flow_val.last_seen = bpf_ktime_get_ns();
@@ -230,28 +307,42 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
 		__u32 baseline_tier_priority;
+		struct dns_cache_priority dns_priority = {
+			.admin = MAX_RULE_PRIORITY,
+			.namespace = MAX_RULE_PRIORITY,
+			.baseline = MAX_RULE_PRIORITY,
+		};
 		int effective_action;
 
 		// 1. Lookup Cluster Network Policy
 		//    a. If matched, return the highest priority (lowest numerical value) action from admin tier
 		//       and the highest priority action (lowest numerical value > ADMIN_TIER_PRIORITY_LIMIT) from baseline tier
+		//    b. If matched in IPCache for DNS rules, return the matching DNS rule priorities.
 		// 2. Evaluate admin tier action:
-		//    a. Admin Tier rules from above rule is compared.
+		//    a. Compare Admin tier CIDR and DNS rules.
 		//       We enforce the lowest priority action. Deny always takes precedence on same priority.
 		//    b. If no match or admin tier action is PASS, proceed to check namespace scoped network policy
 		// 3. Lookup Namespace Scoped Network Policy
-		//    b. evaluate namespace scoped network policy rules and return the action
+		//    a. A namespace DNS rule authorizes the matching address.
+		//    b. Otherwise evaluate namespace scoped network policy rules and return the action
 		//    c. If no match, proceed to evaluate based on baseline tier action from cluster policy
 		// 4. Evaluate baseline tier action
-		//    a. Baseline Tier rules are checked from 1a 
+		//    a. Compare Baseline tier CIDR and DNS rules.
 		//       We enforce the lowest priority action. Deny always takes precedence on same priority.
 		//    b. If no match found, proceed to default pod actions 
 		// 5. If baseline tier action is PASS, enforce default pod policy (DEFAULT_ALLOW or DEFAULT_DENY)
 		
 		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
+		int ipcache_action = checkIPCache(&flow_key->daddr, flow_key->dest_port, flow_key->protocol, &dns_priority);
 
-		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT) {
-			switch (admin_tier_action) {
+		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT ||
+		    dns_priority.admin <= ADMIN_TIER_PRIORITY_LIMIT) {
+			effective_action = admin_tier_action;
+			if (dns_priority.admin < admin_tier_priority ||
+			    (dns_priority.admin == admin_tier_priority && admin_tier_action > ACTION_ALLOW)) {
+				effective_action = ipcache_action;
+			}
+			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;
 				evt->tier = ADMIN_TIER;
@@ -260,7 +351,7 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			}
 			case ACTION_ALLOW: {
 				flow_val.val = pod_state_val;
-				bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
+				bpf_map_update_elem(&aws_conntrack_map, flow_key, &flow_val, 0);
 				evt->verdict = 1;
 				evt->tier = ADMIN_TIER;
 				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
@@ -272,11 +363,14 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		}
 
 		int verdict = evaluateNamespacePolicyByLookUp(trie_key, flow_key, pod_state);
+		if (dns_priority.namespace == NETWORK_POLICY_TIER_PRIORITY) {
+			verdict = ACTION_ALLOW;
+		}
 
 		switch (verdict){
 		case ACTION_ALLOW:{
 			flow_val.val = pod_state_val;
-			bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0); // 0 - BPF_ANY
+			bpf_map_update_elem(&aws_conntrack_map, flow_key, &flow_val, 0); // 0 - BPF_ANY
 			evt->verdict = 1;
 			evt->tier = NETWORK_POLICY_TIER;
 			bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
@@ -289,7 +383,12 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			return BPF_DROP;
 		}
 		case ACTION_PASS:
-			switch (baseline_tier_action) {
+			effective_action = baseline_tier_action;
+			if (dns_priority.baseline < baseline_tier_priority ||
+			    (dns_priority.baseline == baseline_tier_priority && baseline_tier_action > ACTION_ALLOW)) {
+				effective_action = ipcache_action;
+			}
+			switch (effective_action) {
 			case ACTION_DENY: {
 				evt->verdict = 0;
 				evt->tier = BASELINE_TIER;
@@ -298,7 +397,7 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			}
 			case ACTION_ALLOW: {
 				flow_val.val = pod_state_val;
-				bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
+				bpf_map_update_elem(&aws_conntrack_map, flow_key, &flow_val, 0);
 				evt->verdict = 1;
 				evt->tier = BASELINE_TIER;
 				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
@@ -308,7 +407,7 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 				switch (pod_state) {
 				case DEFAULT_ALLOW: {
 					flow_val.val = pod_state_val;
-					bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
+					bpf_map_update_elem(&aws_conntrack_map, flow_key, &flow_val, 0);
 					evt->verdict = 1;
 					evt->tier = DEFAULT_TIER;
 					bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
@@ -450,7 +549,7 @@ int handle_egress(struct __sk_buff *skb)
 
 			// Evaluate the flow again if the pod state has changed and take the decision based on it
 			if (flow_val->val != ct_pod_state_val) {
-				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+				int ret = evaluateFlow(&trie_key, &flow_key, ct_pod_state_val, &evt, pst->state);
 				if (ret == BPF_DROP) {
 					bpf_map_delete_elem(&aws_conntrack_map, &flow_key);
 					return BPF_DROP;
@@ -476,10 +575,10 @@ int handle_egress(struct __sk_buff *skb)
 			return BPF_OK;
 		}
 
-		return evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+		return evaluateFlow(&trie_key, &flow_key, ct_pod_state_val, &evt, pst->state);
 	}
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 2;
+const volatile __u32 NPA_FILE_VERSION = 3;
 char _license[] SEC("license") = "GPL";

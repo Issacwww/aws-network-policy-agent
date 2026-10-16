@@ -32,6 +32,28 @@ type EbpfFirewallRules struct {
 	L4Info     []v1alpha1.Port
 }
 
+func SplitDomainAndIPRules(rules []EbpfFirewallRules) ([]EbpfFirewallRules, []EbpfFirewallRules) {
+	return SegregateDomainAndIPRules(rules)
+}
+
+// SegregateDomainAndIPRules separates egress rules into domain and IP rules.
+// Auto mode normalizes domain names only by adding the DNS root label.
+func SegregateDomainAndIPRules(rules []EbpfFirewallRules) ([]EbpfFirewallRules, []EbpfFirewallRules) {
+	domainRules := make([]EbpfFirewallRules, 0, len(rules))
+	ipRules := make([]EbpfFirewallRules, 0, len(rules))
+	for _, rule := range rules {
+		if rule.DomainName != "" {
+			if !strings.HasSuffix(rule.DomainName, ".") {
+				rule.DomainName += "."
+			}
+			domainRules = append(domainRules, rule)
+		} else {
+			ipRules = append(ipRules, rule)
+		}
+	}
+	return domainRules, ipRules
+}
+
 type FirewallRuleProcessor struct {
 	// Primary IP of the node
 	nodeIP   string
@@ -89,6 +111,13 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 
 	for _, firewallRule := range firewallRules {
 		var cidrL4Info []v1alpha1.Port
+
+		// Domain rules are handled by the DNS policy path when that feature is
+		// enabled. Ignore them here so feature-disabled agents preserve their
+		// existing IP-only behavior.
+		if firewallRule.IPCidr == "" {
+			continue
+		}
 
 		if !strings.Contains(string(firewallRule.IPCidr), "/") {
 			firewallRule.IPCidr += v1alpha1.NetworkAddress(f.hostMask)
@@ -308,6 +337,11 @@ func (f *FirewallRuleProcessor) ComputeClusterPolicyMapEntriesFromEndpointRules(
 
 	// Step 2-3: Process each CIDR and handle overlaps
 	for _, rule := range firewallRules {
+		// Domain rules are handled by the DNS policy path when enabled. When the
+		// feature is disabled, ignore them here and preserve IP-only behavior.
+		if rule.IPCidr == "" {
+			continue
+		}
 
 		cidr := f.normalizeCIDR(string(rule.IPCidr))
 		if f.shouldSkipRule(cidr) {

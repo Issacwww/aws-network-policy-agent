@@ -19,14 +19,17 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
+	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
@@ -103,13 +106,23 @@ func prometheusRegister() {
 }
 
 // NewPolicyEndpointsReconciler constructs new PolicyEndpointReconciler
-func NewPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, enableIPv6 bool) *PolicyEndpointsReconciler {
+func NewPolicyEndpointsReconciler(
+	k8sClient client.Client,
+	nodeIP string,
+	ebpfClient ebpf.BpfClient,
+	enableIPv6 bool,
+	dnsDependencies ...DNSPolicyDependencies,
+) *PolicyEndpointsReconciler {
 	r := &PolicyEndpointsReconciler{
 		k8sClient:        k8sClient,
 		nodeIP:           nodeIP,
 		ebpfClient:       ebpfClient,
 		enableIPv6:       enableIPv6,
 		trackerStartTime: time.Now(),
+	}
+	if len(dnsDependencies) > 0 {
+		r.domainFilter = dnsDependencies[0].Filter
+		r.proxyManager = dnsDependencies[0].Proxy
 	}
 
 	prometheusRegister()
@@ -139,8 +152,10 @@ type PolicyEndpointsReconciler struct {
 	// Maps a Network Policy to list of selected pod Identifiers
 	networkPolicyToPodIdentifierMap sync.Map
 	//BPF Client instance
-	ebpfClient ebpf.BpfClient
-	enableIPv6 bool
+	ebpfClient   ebpf.BpfClient
+	enableIPv6   bool
+	domainFilter filter.Store
+	proxyManager proxymanager.ProxyManager
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints,verbs=get;list;watch
@@ -266,6 +281,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	}
 
 	programmingSucceeded := true
+	var configureErr error
 	for podIdentifier := range podIdentifiers {
 		// Derive Ingress IPs from the PolicyEndpoint
 		ingressRules, egressRules, isIngressIsolated, isEgressIsolated, err := r.deriveIngressAndEgressFirewallRules(ctx, podIdentifier,
@@ -292,6 +308,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 		if err != nil {
 			log().Errorf("Error configuring eBPF Probes %v", err)
 			programmingSucceeded = false
+			configureErr = errors.Join(configureErr, err)
 		}
 		duration := msSince(start)
 		policySetupLatency.WithLabelValues(policyEndpoint.Name, policyEndpoint.Namespace).Observe(duration)
@@ -300,7 +317,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	// Observe E2E policy programming latency (NPC change → NPA eBPF programmed)
 	r.observePolicyProgrammingLatency(policyEndpoint, programmingSucceeded)
 
-	return nil
+	return configureErr
 }
 
 // observePolicyProgrammingLatency emits the E2E latency histogram from the
@@ -347,6 +364,14 @@ func (r *PolicyEndpointsReconciler) observePolicyProgrammingLatency(pe *policyk8
 func (r *PolicyEndpointsReconciler) configureeBPFProbes(ctx context.Context, podIdentifier string,
 	targetPods []npatypes.Pod, ingressRules, egressRules []fwrp.EbpfFirewallRules) error {
 	var err error
+	ipEgressRules := egressRules
+	var domainRules []fwrp.EbpfFirewallRules
+	if r.domainFilter != nil {
+		var splitIPRules []fwrp.EbpfFirewallRules
+		domainRules, splitIPRules = fwrp.SplitDomainAndIPRules(egressRules)
+		ipEgressRules = splitIPRules
+		r.domainFilter.SetRules(podIdentifier, filter.PolicyEndpointSource, domainRules)
+	}
 
 	//Loop over target pods and setup/configure/update eBPF probes/maps
 	for _, pod := range targetPods {
@@ -357,14 +382,22 @@ func (r *PolicyEndpointsReconciler) configureeBPFProbes(ctx context.Context, pod
 		}
 
 		err := r.ebpfClient.AttacheBPFProbes(pod.NamespacedName, podIdentifier, ebpf.INTERFACE_COUNT_UNKNOWN)
+		if errors.Is(err, ebpf.ErrPodDeleted) {
+			continue
+		}
 		if err != nil {
 			log().Errorf("Failed to attach eBPF probes for pod %s namespace %s : %v", pod.Name, pod.Namespace, err)
 			return err
 		}
 		log().Infof("Successfully attached required eBPF probes for pod: %s in namespace %s", pod.Name, pod.Namespace)
+		if r.proxyManager != nil {
+			if err := r.proxyManager.SyncPod(pod, podIdentifier); err != nil {
+				return fmt.Errorf("sync DNS policy for pod %s: %w", pod.NamespacedName, err)
+			}
+		}
 	}
 
-	err = r.updateeBPFMaps(podIdentifier, ingressRules, egressRules, ebpf.POLICIES_APPLIED)
+	err = r.updateeBPFMaps(podIdentifier, ingressRules, ipEgressRules, ebpf.POLICIES_APPLIED)
 	if err != nil {
 		log().Errorf("Map updates failed for podIdentifier %s: %v", podIdentifier, err)
 		return err
@@ -412,6 +445,14 @@ func (r *PolicyEndpointsReconciler) cleanupPod(ctx context.Context, targetPod np
 				log().Errorf("Map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
 				return err
 			}
+			if r.domainFilter != nil {
+				r.domainFilter.DeleteRules(podIdentifier, filter.PolicyEndpointSource)
+			}
+			if r.proxyManager != nil {
+				if err := r.proxyManager.SyncPod(targetPod, podIdentifier); err != nil {
+					return err
+				}
+			}
 		} else {
 			// We've additional PolicyEndpoint resources configured against this pod
 			// Update the Maps and move on
@@ -431,13 +472,37 @@ func (r *PolicyEndpointsReconciler) cleanupPod(ctx context.Context, targetPod np
 				r.addCatchAllEntry(&egressRules)
 			}
 
-			err = r.updateeBPFMaps(podIdentifier, ingressRules, egressRules, ebpf.POLICIES_APPLIED)
+			ipEgressRules := egressRules
+			var domainRules []fwrp.EbpfFirewallRules
+			if r.domainFilter != nil {
+				var splitIPRules []fwrp.EbpfFirewallRules
+				domainRules, splitIPRules = fwrp.SplitDomainAndIPRules(egressRules)
+				ipEgressRules = splitIPRules
+			}
+			err = r.updateeBPFMaps(podIdentifier, ingressRules, ipEgressRules, ebpf.POLICIES_APPLIED)
 			if err != nil {
 				log().Errorf("Map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
 				return err
 			}
+			if err := syncDNSPolicyForPods(
+				r.domainFilter,
+				r.proxyManager,
+				filter.PolicyEndpointSource,
+				podIdentifier,
+				domainRules,
+				[]npatypes.Pod{targetPod},
+			); err != nil {
+				return err
+			}
 		}
 
+		return nil
+	}
+	if r.domainFilter != nil {
+		r.domainFilter.DeleteRules(podIdentifier, filter.PolicyEndpointSource)
+	}
+	if r.proxyManager != nil {
+		return r.proxyManager.SyncPod(targetPod, podIdentifier)
 	}
 	return nil
 }
@@ -486,16 +551,13 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 					log().Warnf("both CIDR and DomainName are empty in PE name %s, NS: %s", currentPE.Name, currentPE.Namespace)
 					continue
 				}
-				if endPointInfo.CIDR == "" {
-					log().Infof("CIDR is empty, skipping the egress rule %s, NS: %s", currentPE.Name, currentPE.Namespace)
-					continue
-				}
-
 				egressRules = append(egressRules,
 					fwrp.EbpfFirewallRules{
-						IPCidr: endPointInfo.CIDR,
-						Except: endPointInfo.Except,
-						L4Info: endPointInfo.Ports,
+						Priority:   utils.PE_PRIORITY*10 + int(utils.ActionAccept),
+						DomainName: string(endPointInfo.DomainName),
+						IPCidr:     endPointInfo.CIDR,
+						Except:     endPointInfo.Except,
+						L4Info:     endPointInfo.Ports,
 					})
 			}
 			log().Infof("Total no.of - ingressRules %d egressRules %d", len(ingressRules), len(egressRules))
@@ -805,7 +867,7 @@ func (r *PolicyEndpointsReconciler) DeriveFireWallRulesPerPodIdentifier(podIdent
 		podNamespace, "", false)
 	if err != nil {
 		log().Errorf("Error deriving firewall rules: %v", err)
-		return ingressRules, egressRules, nil
+		return ingressRules, egressRules, err
 	}
 
 	if len(ingressRules) == 0 && !isIngressIsolated {

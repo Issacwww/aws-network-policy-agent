@@ -20,6 +20,7 @@ import (
 
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 
@@ -110,17 +111,33 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 	policiesAvailableInLocalCache := s.policyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
 	clusterPolicyAvailableInLocalCache := s.clusterPolicyReconciler.ArePoliciesAvailableInLocalCache(podIdentifier)
 
+	var ingressRules, egressRules, ipEgressRules []fwrp.EbpfFirewallRules
+	if policiesAvailableInLocalCache {
+		ingressRules, egressRules, err =
+			s.policyReconciler.DeriveFireWallRulesPerPodIdentifier(podIdentifier, in.K8S_POD_NAMESPACE)
+		if err != nil {
+			return nil, err
+		}
+		_, ipEgressRules = fwrp.SplitDomainAndIPRules(egressRules)
+	}
+
+	var clusterIngressRules, clusterEgressRules, clusterIPEgressRules []fwrp.EbpfFirewallRules
+	if clusterPolicyAvailableInLocalCache {
+		clusterIngressRules, clusterEgressRules, err =
+			s.clusterPolicyReconciler.DeriveClusterPolicyFireWallRulesPerPodIdentifier(ctx, podIdentifier)
+		if err != nil {
+			return nil, err
+		}
+		_, clusterIPEgressRules = fwrp.SplitDomainAndIPRules(clusterEgressRules)
+	}
+
 	if (policiesAvailableInLocalCache || clusterPolicyAvailableInLocalCache) && isFirstPodInPodIdentifier {
 		// If we're here, then the local agent knows the list of active policies that apply to this pod and
 		// this is the first pod of it's type to land on the local node/cluster
 		log().Info("Active policies present against this pod and this is a new Pod to the local node, configuring firewall rules....")
 
 		if policiesAvailableInLocalCache {
-			//Derive Ingress and Egress Firewall Rules and Update the relevant eBPF maps
-			ingressRules, egressRules, _ :=
-				s.policyReconciler.DeriveFireWallRulesPerPodIdentifier(podIdentifier, in.K8S_POD_NAMESPACE)
-
-			err = s.policyReconciler.GeteBPFClient().UpdateEbpfMaps(podIdentifier, ingressRules, egressRules)
+			err = s.policyReconciler.GeteBPFClient().UpdateEbpfMaps(podIdentifier, ingressRules, ipEgressRules)
 			if err != nil {
 				log().Errorf("Network Policy map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
 				return nil, err
@@ -129,11 +146,9 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 		}
 
 		if clusterPolicyAvailableInLocalCache {
-
-			clusterIngressRules, clusterEgressRules, _ :=
-				s.clusterPolicyReconciler.DeriveClusterPolicyFireWallRulesPerPodIdentifier(ctx, podIdentifier)
-
-			err = s.clusterPolicyReconciler.GeteBPFClient().UpdateClusterPolicyEbpfMaps(podIdentifier, clusterIngressRules, clusterEgressRules)
+			err = s.clusterPolicyReconciler.GeteBPFClient().UpdateClusterPolicyEbpfMaps(
+				podIdentifier, clusterIngressRules, clusterIPEgressRules,
+			)
 			if err != nil {
 				log().Errorf("Cluster Policy map update(s) failed for podIdentifier: %s, error: %v", podIdentifier, err)
 				return nil, err
@@ -202,6 +217,11 @@ func (s *server) DeletePodNp(ctx context.Context, in *rpc.DeleteNpRequest) (*rpc
 	err := s.policyReconciler.GeteBPFClient().DeleteBPFProbes(pod, podIdentifier)
 	if err != nil {
 		log().Errorf("Failed to delete BPF probes for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
+		return &rpc.DeleteNpReply{Success: false}, err
+	}
+
+	if err := s.policyReconciler.RemoveDNSPolicyForPod(pod); err != nil {
+		log().Errorf("Failed to delete DNS redirection for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
 		return &rpc.DeleteNpReply{Success: false}, err
 	}
 

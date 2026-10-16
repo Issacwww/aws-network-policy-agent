@@ -25,9 +25,14 @@ const (
 	flagEnableCloudWatchLogs           = "enable-cloudwatch-logs"
 	flagEnableIPv6                     = "enable-ipv6"
 	flagEnableNetworkPolicy            = "enable-network-policy"
+	flagEnableDNSPolicy                = "enable-dns-policy"
+	flagDNSPolicyNftPriority           = "dns-policy-nft-priority"
+	flagDNSPolicyUpstreamSource        = "dns-policy-upstream-source"
 	flagConntrackCacheCleanupPeriod    = "conntrack-cache-cleanup-period"
 	flagConntrackCacheTableSize        = "conntrack-cache-table-size"
 	flagEnableProfiling                = "enable-profiling"
+	defaultDNSPolicyNftPriority        = -110
+	defaultDNSPolicyUpstreamSource     = "kube-dns"
 )
 
 // ControllerConfig contains the controller configuration
@@ -50,6 +55,12 @@ type ControllerConfig struct {
 	EnableIPv6 bool
 	// Enable Network Policy
 	EnableNetworkPolicy bool
+	// Enable DNS Policy
+	EnableDNSPolicy bool
+	// DNSPolicyNftPriority selects OSS ordering (-110) or Auto parity (-100).
+	DNSPolicyNftPriority int
+	// DNSPolicyUpstreamSource selects kube-dns or Bottlerocket settings discovery.
+	DNSPolicyUpstreamSource string
 	// ConntrackCacheCleanupPeriod specifies the cleanup period
 	ConntrackCacheCleanupPeriod int
 	// ConntrackTableSize specifies the conntrack table size for the agent
@@ -75,6 +86,9 @@ func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&cfg.EnableCloudWatchLogs, flagEnableCloudWatchLogs, false, "If enabled, policy decision logs will be streamed to CloudWatch, requires \"enable-policy-event-logs=true\"")
 	fs.BoolVar(&cfg.EnableIPv6, flagEnableIPv6, false, "If enabled, Network Policy agent will operate in IPv6 mode")
 	fs.BoolVar(&cfg.EnableNetworkPolicy, flagEnableNetworkPolicy, false, "If enabled, Network Policy agent will initialize BPF maps and start reconciler")
+	fs.BoolVar(&cfg.EnableDNSPolicy, flagEnableDNSPolicy, false, "If enabled, Network Policy agent will enforce domain-based egress policy")
+	fs.IntVar(&cfg.DNSPolicyNftPriority, flagDNSPolicyNftPriority, defaultDNSPolicyNftPriority, "DNS prerouting chain priority; supported values are -110 and -100")
+	fs.StringVar(&cfg.DNSPolicyUpstreamSource, flagDNSPolicyUpstreamSource, defaultDNSPolicyUpstreamSource, "DNS upstream discovery source; supported values are kube-dns and bottlerocket")
 	fs.BoolVar(&cfg.EnableProfiling, flagEnableProfiling, false, "If enabled, Network Policy agent will enable profiling")
 	fs.IntVar(&cfg.ConntrackCacheCleanupPeriod, flagConntrackCacheCleanupPeriod, defaultConntrackCacheCleanupPeriod, ""+
 		"Cleanup interval for network policy agent conntrack cache")
@@ -89,6 +103,12 @@ func (cfg *ControllerConfig) ValidControllerFlags() error {
 	// Validate conntrack cache table size
 	if cfg.ConntrackCacheTableSize < (32*1024) || cfg.ConntrackCacheTableSize > (1024*1024) {
 		return errors.New("Invalid conntrack cache table size, should be between 32K and 1024K")
+	}
+	if cfg.DNSPolicyNftPriority != -110 && cfg.DNSPolicyNftPriority != -100 {
+		return errors.New("Invalid DNS policy nft priority, supported values are -110 and -100")
+	}
+	if cfg.DNSPolicyUpstreamSource != "kube-dns" && cfg.DNSPolicyUpstreamSource != "bottlerocket" {
+		return errors.New("Invalid DNS policy upstream source, supported values are kube-dns and bottlerocket")
 	}
 	return nil
 }

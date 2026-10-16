@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"runtime"
 
 	"sync"
 	"time"
 	"unsafe"
-
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
@@ -22,44 +22,48 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/events"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
+	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/aws/aws-network-policy-agent/pkg/utils/cp"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 var (
-	TC_INGRESS_BINARY                                = "tc.v4ingress.bpf.o"
-	TC_EGRESS_BINARY                                 = "tc.v4egress.bpf.o"
-	TC_V6_INGRESS_BINARY                             = "tc.v6ingress.bpf.o"
-	TC_V6_EGRESS_BINARY                              = "tc.v6egress.bpf.o"
-	EVENTS_BINARY                                    = "v4events.bpf.o"
-	EVENTS_V6_BINARY                                 = "v6events.bpf.o"
-	AWS_CONNTRACK_MAP                                = "aws_conntrack_map"
-	AWS_EVENTS_MAP                                   = "policy_events"
-	EKS_CLI_BINARY                                   = "aws-eks-na-cli"
-	EKS_V6_CLI_BINARY                                = "aws-eks-na-cli-v6"
-	hostBinaryPath                                   = "/host/opt/cni/bin/"
-	IPv4_HOST_MASK                                   = "/32"
-	IPv6_HOST_MASK                                   = "/128"
-	CONNTRACK_MAP_PIN_PATH                           = "/sys/fs/bpf/globals/aws/maps/global_aws_conntrack_map"
-	POLICY_EVENTS_MAP_PIN_PATH                       = "/sys/fs/bpf/globals/aws/maps/global_policy_events"
-	CATCH_ALL_PROTOCOL               corev1.Protocol = "ANY_IP_PROTOCOL"
-	POD_VETH_PREFIX                                  = "eni"
-	POLICIES_APPLIED                                 = 0
-	DEFAULT_ALLOW                                    = 1
-	DEFAULT_DENY                                     = 2
-	POD_STATE_MAP_KEY                                = 0
-	CLUSTER_POLICY_POD_STATE_MAP_KEY                 = 1
-	BRANCH_ENI_VETH_PREFIX                           = "vlan"
-	INTERFACE_COUNT_UNKNOWN                          = -1 // Used when caller doesn't know interface count
-	INTERFACE_COUNT_DEFAULT                          = 1  // Default single interface
-	IPAM_JSON_PATH                                   = "/var/run/aws-node/ipam.json"
-	deletedPodsMinAge                                = 5 * time.Minute
+	TC_INGRESS_BINARY                = "tc.v4ingress.bpf.o"
+	TC_EGRESS_BINARY                 = "tc.v4egress.bpf.o"
+	TC_DNS_EGRESS_BINARY             = "tc.v4egress.dns.bpf.o"
+	TC_V6_INGRESS_BINARY             = "tc.v6ingress.bpf.o"
+	TC_V6_EGRESS_BINARY              = "tc.v6egress.bpf.o"
+	EVENTS_BINARY                    = "v4events.bpf.o"
+	EVENTS_V6_BINARY                 = "v6events.bpf.o"
+	AWS_CONNTRACK_MAP                = "aws_conntrack_map"
+	AWS_EVENTS_MAP                   = "policy_events"
+	EKS_CLI_BINARY                   = "aws-eks-na-cli"
+	EKS_V6_CLI_BINARY                = "aws-eks-na-cli-v6"
+	hostBinaryPath                   = "/host/opt/cni/bin/"
+	IPv4_HOST_MASK                   = "/32"
+	IPv6_HOST_MASK                   = "/128"
+	CONNTRACK_MAP_PIN_PATH           = "/sys/fs/bpf/globals/aws/maps/global_aws_conntrack_map"
+	POLICY_EVENTS_MAP_PIN_PATH       = "/sys/fs/bpf/globals/aws/maps/global_policy_events"
+	POD_VETH_PREFIX                  = "eni"
+	POLICIES_APPLIED                 = 0
+	DEFAULT_ALLOW                    = 1
+	DEFAULT_DENY                     = 2
+	POD_STATE_MAP_KEY                = 0
+	CLUSTER_POLICY_POD_STATE_MAP_KEY = 1
+	BRANCH_ENI_VETH_PREFIX           = "vlan"
+	INTERFACE_COUNT_UNKNOWN          = -1 // Used when caller doesn't know interface count
+	INTERFACE_COUNT_DEFAULT          = 1  // Default single interface
+	IPAM_JSON_PATH                   = "/var/run/aws-node/ipam.json"
+	deletedPodsMinAge                = 5 * time.Minute
 )
+
+var ErrPodDeleted = errors.New("pod has been deleted")
 
 func log() logger.Logger {
 	return logger.Get()
@@ -135,6 +139,7 @@ type BpfClient interface {
 	CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key int, state int) error
 	ClearDeletedPod(podNamespacedName string)
 	HasBPFContext(podIdentifier string) bool
+	WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, rules []npatypes.L4Rule) error
 }
 
 type BPFContext struct {
@@ -144,7 +149,7 @@ type BPFContext struct {
 }
 
 func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs bool,
-	enableIPv6 bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string) (*bpfClient, error) {
+	enableIPv6, enableDNSPolicy bool, conntrackTTL int, conntrackTableSize int, networkPolicyMode string, isMultiNICEnabled bool, logLevel string) (*bpfClient, error) {
 	var conntrackMap goebpfmaps.BpfMap
 
 	ebpfClient := &bpfClient{
@@ -164,12 +169,18 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		clusterPolicyIngressInMemoryMap: new(sync.Map),
 		clusterPolicyEgressInMemoryMap:  new(sync.Map),
 		deletedPods:                     new(sync.Map),
+		enableIPv6:                      enableIPv6,
+		enableDNSPolicy:                 enableDNSPolicy,
 	}
 	ingressBinary, egressBinary, eventsBinary,
 		cliBinary, hostMask := TC_INGRESS_BINARY, TC_EGRESS_BINARY, EVENTS_BINARY, EKS_CLI_BINARY, IPv4_HOST_MASK
 	if enableIPv6 {
 		ingressBinary, egressBinary, eventsBinary,
 			cliBinary, hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, EKS_V6_CLI_BINARY, IPv6_HOST_MASK
+	} else if enableDNSPolicy {
+		if err := activateDNSEgressBinary(TC_DNS_EGRESS_BINARY, TC_EGRESS_BINARY); err != nil {
+			return nil, fmt.Errorf("activate DNS egress binary: %w", err)
+		}
 	}
 	ebpfClient.ingressBinary, ebpfClient.egressBinary,
 		ebpfClient.hostMask = ingressBinary, egressBinary, hostMask
@@ -363,6 +374,11 @@ type bpfClient struct {
 	clusterPolicyEgressInMemoryMap *sync.Map
 	// This is in-memory map to track recently deleted pods (key: podNamespacedName, value: time added to map)
 	deletedPods *sync.Map
+	// enableIPv6 selects IPv6 key and probe handling, including the DNS ipcache.
+	enableIPv6 bool
+	// enableDNSPolicy selects the opt-in IPv4 egress binary that contains the DNS ipcache.
+	// The IPv6 egress binary includes the map unconditionally, matching Auto.
+	enableDNSPolicy bool
 }
 
 func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostBinaryPath string) (bool, bool, bool, error) {
@@ -401,13 +417,27 @@ func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostB
 				log().Info("change detected in ingress probe binaries.. ")
 				updateIngressProbe = true
 			}
-			if bpfProbe == TC_EGRESS_BINARY || bpfProbe == TC_V6_EGRESS_BINARY {
+			if isEgressBPFProbe(bpfProbe) {
 				log().Info("change detected in egress probe binaries..")
 				updateEgressProbe = true
 			}
 		}
 	}
 	return updateIngressProbe, updateEgressProbe, updateEventsProbe, nil
+}
+
+func isEgressBPFProbe(binary string) bool {
+	return binary == TC_EGRESS_BINARY ||
+		binary == TC_DNS_EGRESS_BINARY ||
+		binary == TC_V6_EGRESS_BINARY
+}
+
+func activateDNSEgressBinary(source, destination string) error {
+	dnsBinary, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(destination, dnsBinary, 0o644)
 }
 
 func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.BpfSDKClient, policyEndpointeBPFContext *sync.Map, globalMaps *sync.Map, updateIngressProbe,
@@ -711,6 +741,134 @@ func (l *bpfClient) getInterfaceCountForPod(pod types.NamespacedName, podIdentif
 	return 0, errors.New("Skipping probe attach: multiNIC enabled and interface count is unknown")
 }
 
+func encodeIPCacheKey(ip net.IP, enableIPv6 bool) ([16]byte, error) {
+	var key [16]byte
+	if enableIPv6 {
+		ipv6 := ip.To16()
+		if ipv6 == nil || ip.To4() != nil {
+			return key, fmt.Errorf("IP %q is not IPv6", ip)
+		}
+		copy(key[:], ipv6)
+		return key, nil
+	}
+
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return key, fmt.Errorf("IP %q is not IPv4", ip)
+	}
+	copy(key[:4], ipv4)
+	return key, nil
+}
+
+type ipcacheMapWriter interface {
+	writeIPCacheEntry(key *[16]byte, value *npatypes.IPCacheVal, updateFlags uint64) error
+}
+
+type bpfIPCacheMapWriter struct {
+	ipcacheMap *goebpfmaps.BpfMap
+}
+
+func (w bpfIPCacheMapWriter) writeIPCacheEntry(
+	key *[16]byte,
+	value *npatypes.IPCacheVal,
+	updateFlags uint64,
+) error {
+	err := w.ipcacheMap.CreateUpdateMapEntry(
+		uintptr(unsafe.Pointer(&key[0])),
+		uintptr(unsafe.Pointer(value)),
+		updateFlags,
+	)
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(value)
+	return err
+}
+
+type encodedIPCacheEntry struct {
+	ip    net.IP
+	key   [16]byte
+	value npatypes.IPCacheVal
+}
+
+func encodeIPCacheEntries(
+	enableIPv6 bool,
+	nowNs uint64,
+	ips []npatypes.IPWithTTL,
+	l4Rules []npatypes.L4Rule,
+) []encodedIPCacheEntry {
+	l4RulesBytes := utils.ComputeValueForL4Rules(l4Rules)
+	entries := make([]encodedIPCacheEntry, 0, len(ips))
+	for _, ipWithTTL := range ips {
+		key, err := encodeIPCacheKey(ipWithTTL.IP, enableIPv6)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, encodedIPCacheEntry{
+			ip:  ipWithTTL.IP,
+			key: key,
+			value: npatypes.IPCacheVal{
+				ExpiryTime: nowNs + uint64(ipWithTTL.TTL)*uint64(time.Second),
+				Ports:      [npatypes.L4RULE_VALUES_LENGTH]byte(l4RulesBytes),
+			},
+		})
+	}
+	return entries
+}
+
+func writeIPCacheEntries(
+	ipcacheMap ipcacheMapWriter,
+	enableIPv6 bool,
+	nowNs uint64,
+	ips []npatypes.IPWithTTL,
+	l4Rules []npatypes.L4Rule,
+) error {
+	for _, entry := range encodeIPCacheEntries(enableIPv6, nowNs, ips, l4Rules) {
+		if err := ipcacheMap.writeIPCacheEntry(&entry.key, &entry.value, 0); err != nil {
+			return fmt.Errorf("write IP %s to %s: %w", entry.ip, utils.TC_IPCACHE_MAP, err)
+		}
+	}
+	return nil
+}
+
+func (l *bpfClient) WriteIPsForPod(podIdentifier string, ips []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error {
+	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
+	podIdentifierLock := value.(*sync.Mutex)
+	podIdentifierLock.Lock()
+	defer podIdentifierLock.Unlock()
+
+	contextValue, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
+	if !ok {
+		return fmt.Errorf("no bpf context registered for pod %s", podIdentifier)
+	}
+	bpfContext, ok := contextValue.(BPFContext)
+	if !ok {
+		return fmt.Errorf("unexpected bpf context type %T for pod %s", contextValue, podIdentifier)
+	}
+	ipcacheMap, ok := bpfContext.egressPgmInfo.Maps[utils.TC_IPCACHE_MAP]
+	if !ok || ipcacheMap.MapFD == 0 {
+		return fmt.Errorf("no %s registered for pod %s", utils.TC_IPCACHE_MAP, podIdentifier)
+	}
+
+	nowNs, err := ktimeBootNs()
+	if err != nil {
+		return fmt.Errorf("get boot time: %w", err)
+	}
+	return writeIPCacheEntries(
+		bpfIPCacheMapWriter{ipcacheMap: &ipcacheMap},
+		l.enableIPv6,
+		nowNs,
+		ips,
+		l4Rules,
+	)
+}
+
+func ktimeBootNs() (uint64, error) {
+	var timestamp unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &timestamp); err != nil {
+		return 0, err
+	}
+	return uint64(timestamp.Sec)*uint64(time.Second) + uint64(timestamp.Nsec), nil
+}
+
 func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {
 	var ingressProgFD int
 	var egressProgFD int
@@ -719,7 +877,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 
 	if _, deleted := l.deletedPods.Load(podNamespacedName); deleted {
 		log().Debugf("ignoring attaching ebpf probe to pod %s in namespace %s with pod identifier %s as it is already deleted", pod.Name, pod.Namespace, podIdentifier)
-		return nil
+		return ErrPodDeleted
 	}
 
 	// Two go routines can try to attach the probes at the same time
@@ -961,16 +1119,19 @@ func (l *bpfClient) deleteBPFProgramAndMaps(podIdentifier string, direction stri
 	pgmPinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction)
 	mapPinpath, clusterPolicyMapPinpath := utils.GetBPFMapPinPathFromPodIdentifier(podIdentifier, direction)
 	podStateMapPinPath := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, direction)
+	ipcacheMapPinPath := utils.GetIPCacheBPFMapPinPathFromPodIdentifier(podIdentifier)
 
 	log().Infof("Deleting: Program: %s Map: %s Map: %s", pgmPinPath, mapPinpath, podStateMapPinPath)
 
 	pgmInfo := peBPFContext.ingressPgmInfo
 	mapToDelete, clusterPolicyMap := pgmInfo.Maps[utils.TC_INGRESS_MAP], pgmInfo.Maps[utils.TC_CLUSTER_POLICY_INGRESS_MAP]
 	podStateMapToDelete := pgmInfo.Maps[utils.TC_INGRESS_POD_STATE_MAP]
+	var ipcacheMapToDelete goebpfmaps.BpfMap
 	if direction == "egress" {
 		pgmInfo = peBPFContext.egressPgmInfo
 		mapToDelete, clusterPolicyMap = pgmInfo.Maps[utils.TC_EGRESS_MAP], pgmInfo.Maps[utils.TC_CLUSTER_POLICY_EGRESS_MAP]
 		podStateMapToDelete = pgmInfo.Maps[utils.TC_EGRESS_POD_STATE_MAP]
+		ipcacheMapToDelete = pgmInfo.Maps[utils.TC_IPCACHE_MAP]
 	}
 
 	if pgmInfo.Program.ProgFD != 0 {
@@ -990,6 +1151,12 @@ func (l *bpfClient) deleteBPFProgramAndMaps(podIdentifier string, direction stri
 		err = clusterPolicyMap.UnPinMap(clusterPolicyMapPinpath)
 		if err != nil {
 			log().Errorf("Failed to delete the cluster policy Map: %v", err)
+		}
+		if direction == "egress" && ipcacheMapToDelete.MapFD != 0 {
+			err = ipcacheMapToDelete.UnPinMap(ipcacheMapPinPath)
+			if err != nil {
+				log().Errorf("Failed to delete the DNS ipcache Map: %v", err)
+			}
 		}
 	}
 	return nil

@@ -16,6 +16,25 @@ const (
 	kubeDNSServiceHostEnv = "KUBE_DNS_SERVICE_HOST"
 )
 
+// ResolveDNSPolicyUpstream reports whether DNS policy can run on this node and, if it can, the
+// address its proxy forwards queries to. It returns a reason to log whenever DNS policy stays off.
+//
+// DNS policy is IPv4 only for now, and it needs the address of the cluster DNS service. When
+// either is missing the agent keeps enforcing everything else instead of failing: it serves the
+// socket the CNI plugin calls on every pod setup, so exiting here would stop new pods from
+// starting on the node. The controllers then skip domainName entries, as before DNS policy
+// support, and an operator sees the reason in the agent log.
+func ResolveDNSPolicyUpstream(source string, enableIPv6 bool) (upstreamIP net.IP, enabled bool, reason string) {
+	if enableIPv6 {
+		return nil, false, "DNS policy is not supported on IPv6 clusters"
+	}
+	upstreamIP, err := GetUpstreamDNSIP(source)
+	if err != nil {
+		return nil, false, fmt.Sprintf("the upstream DNS server could not be discovered (source %s): %v", source, err)
+	}
+	return upstreamIP, true, ""
+}
+
 // GetUpstreamDNSIP returns the IPv4 address the DNS policy proxy forwards queries to.
 func GetUpstreamDNSIP(source string) (net.IP, error) {
 	switch source {

@@ -60,3 +60,59 @@ func TestGetUpstreamDNSIP_UnknownSource(t *testing.T) {
 	_, err := GetUpstreamDNSIP("coredns")
 	assert.ErrorContains(t, err, `unsupported DNS upstream source "coredns"`)
 }
+
+// A node that cannot run DNS policy must keep the agent alive, because the CNI plugin needs its
+// socket to set up every new pod. Only the domainName rules are given up.
+func TestResolveDNSPolicyUpstream(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      string
+		enableIPv6  bool
+		kubeDNSHost string
+		wantIP      string
+		wantEnabled bool
+		wantReason  string
+	}{
+		{
+			name:        "kube-dns Service IP found",
+			source:      UpstreamSourceKubeDNS,
+			kubeDNSHost: "10.100.0.10",
+			wantIP:      "10.100.0.10",
+			wantEnabled: true,
+		},
+		{
+			name:       "no kube-dns Service IP",
+			source:     UpstreamSourceKubeDNS,
+			wantReason: "the upstream DNS server could not be discovered (source kube-dns): KUBE_DNS_SERVICE_HOST is not set",
+		},
+		{
+			name:       "unsupported source",
+			source:     "coredns",
+			wantReason: `the upstream DNS server could not be discovered (source coredns): unsupported DNS upstream source "coredns"`,
+		},
+		{
+			name:        "IPv6 cluster",
+			source:      UpstreamSourceKubeDNS,
+			enableIPv6:  true,
+			kubeDNSHost: "10.100.0.10",
+			wantReason:  "DNS policy is not supported on IPv6 clusters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("KUBE_DNS_SERVICE_HOST", tt.kubeDNSHost)
+
+			ip, enabled, reason := ResolveDNSPolicyUpstream(tt.source, tt.enableIPv6)
+
+			assert.Equal(t, tt.wantEnabled, enabled)
+			if !tt.wantEnabled {
+				assert.Nil(t, ip)
+				assert.Contains(t, reason, tt.wantReason)
+				return
+			}
+			assert.Equal(t, tt.wantIP, ip.String())
+			assert.Empty(t, reason)
+		})
+	}
+}

@@ -138,19 +138,11 @@ func main() {
 
 		npMode, isMultiNICEnabled := lo.Must2(getNetworkPolicyConfigsFromIpamd(ctx, log))
 
-		// DNS policy (domainName egress rules) is IPv4 only for now. On IPv6 clusters proxyManager stays nil
-		// and the controllers skip domainName entries, as before DNS policy support.
-		enableDNSPolicy := !ctrlConfig.EnableIPv6
-		var upstreamIP net.IP
-		if enableDNSPolicy {
-			upstreamIP, err = dnsDiscovery.GetUpstreamDNSIP(ctrlConfig.DNSPolicyUpstreamSource)
-			if err != nil {
-				log.Errorf("DNS policy upstream DNS server could not be discovered (source %s): %v",
-					ctrlConfig.DNSPolicyUpstreamSource, err)
-				os.Exit(1)
-			}
-		} else {
-			log.Info("DNS policy is not supported on IPv6 clusters, domainName egress rules are ignored")
+		// When DNS policy cannot run, proxyManager stays nil and the controllers skip domainName
+		// entries, as before DNS policy support. The rest of the policies are still enforced.
+		upstreamIP, enableDNSPolicy, dnsPolicyOffReason := dnsDiscovery.ResolveDNSPolicyUpstream(ctrlConfig.DNSPolicyUpstreamSource, ctrlConfig.EnableIPv6)
+		if !enableDNSPolicy {
+			log.Errorf("DNS policy is disabled, domainName egress rules are ignored: %s", dnsPolicyOffReason)
 		}
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,

@@ -195,3 +195,144 @@ func TestCleanupClusterPolicyPod_LastPolicyRemovesDomainRules(t *testing.T) {
 	assert.False(t, filter.HasClusterPolicyEndpointDomains(podIdentifier))
 	assert.Equal(t, []types.NamespacedName{pod.NamespacedName}, proxy.removedPods)
 }
+
+// recordingDomainProxy records DNS redirection removals.
+type recordingDomainProxy struct {
+	proxymanager.ProxyManagerMock
+	removedPods []types.NamespacedName
+}
+
+func (p *recordingDomainProxy) RemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error {
+	p.removedPods = append(p.removedPods, pod)
+	return nil
+}
+
+func TestCleanupPod_PolicyEndpointDomainRules(t *testing.T) {
+	protocolTCP := corev1.ProtocolTCP
+	var port443 int32 = 443
+	namespace := "pe-cleanup"
+	cleanedUpPE := "deleted-abcde"
+	remainingPE := "remaining-abcde"
+
+	remainingDomainPE := policyk8sawsv1.PolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: remainingPE, Namespace: namespace},
+		Spec: policyk8sawsv1.PolicyEndpointSpec{
+			PodSelector:  &metav1.LabelSelector{},
+			PolicyRef:    policyk8sawsv1.PolicyReference{Name: "remaining", Namespace: namespace},
+			PodIsolation: []networking.PolicyType{networking.PolicyTypeEgress},
+			Egress: []policyk8sawsv1.EndpointInfo{{
+				DomainName: "aws.com",
+				Ports:      []policyk8sawsv1.Port{{Protocol: &protocolTCP, Port: &port443}},
+			}},
+		},
+	}
+	remainingIPPE := policyk8sawsv1.PolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: remainingPE, Namespace: namespace},
+		Spec: policyk8sawsv1.PolicyEndpointSpec{
+			PodSelector:  &metav1.LabelSelector{},
+			PolicyRef:    policyk8sawsv1.PolicyReference{Name: "remaining", Namespace: namespace},
+			PodIsolation: []networking.PolicyType{networking.PolicyTypeEgress},
+			Egress: []policyk8sawsv1.EndpointInfo{{
+				CIDR:  "10.0.0.0/8",
+				Ports: []policyk8sawsv1.Port{{Protocol: &protocolTCP, Port: &port443}},
+			}},
+		},
+	}
+
+	for _, tc := range []struct {
+		name            string
+		remaining       *policyk8sawsv1.PolicyEndpoint
+		wantDomains     bool
+		wantRemovedPods int
+	}{
+		{name: "no policy left removes domains and redirection", remaining: nil, wantDomains: false, wantRemovedPods: 1},
+		{name: "remaining policy with a domain keeps the domains", remaining: &remainingDomainPE, wantDomains: true, wantRemovedPods: 0},
+		{name: "remaining policy without a domain removes domains and redirection", remaining: &remainingIPPE, wantDomains: false, wantRemovedPods: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targetPod := npatypes.Pod{NamespacedName: types.NamespacedName{Name: "client", Namespace: namespace}}
+			podIdentifier := utils.GetPodIdentifier(targetPod.Name, targetPod.Namespace)
+			t.Cleanup(func() { filter.DeletePolicyEndpointDomains(podIdentifier) })
+			assert.NoError(t, filter.SetPolicyEndpointDomains(podIdentifier, []fwrp.EbpfFirewallRules{{DomainName: "deleted.example.com."}}))
+
+			ctrl := gomock.NewController(t)
+			mockClient := mock_client.NewMockClient(ctrl)
+			proxy := &recordingDomainProxy{}
+			r := NewPolicyEndpointsReconciler(mockClient, "1.1.1.1", &ebpf.MockBpfClient{}, false, proxy)
+			if tc.remaining != nil {
+				remaining := tc.remaining
+				r.podIdentifierToPolicyEndpointMap.Store(podIdentifier, []string{remaining.Name})
+				mockClient.EXPECT().Get(gomock.Any(), types.NamespacedName{Name: remaining.Name, Namespace: namespace}, gomock.Any()).DoAndReturn(
+					func(ctx context.Context, key types.NamespacedName, currentPE *policyk8sawsv1.PolicyEndpoint, opts ...client.GetOption) error {
+						*currentPE = *remaining
+						return nil
+					},
+				).AnyTimes()
+			} else {
+				// the deleted endpoint is the only one left in the map; the delete flow skips it
+				r.podIdentifierToPolicyEndpointMap.Store(podIdentifier, []string{cleanedUpPE})
+			}
+
+			assert.NoError(t, r.cleanupPod(context.Background(), targetPod, cleanedUpPE, true))
+
+			assert.Equal(t, tc.wantDomains, filter.HasPolicyEndpointDomains(podIdentifier))
+			if tc.wantDomains {
+				ipFilter, ok := filter.GetIPFilter(podIdentifier)
+				assert.True(t, ok)
+				allowed, _ := ipFilter.IsAllowed("aws.com.")
+				assert.True(t, allowed)
+				allowed, _ = ipFilter.IsAllowed("deleted.example.com.")
+				assert.False(t, allowed)
+			}
+			assert.Len(t, proxy.removedPods, tc.wantRemovedPods)
+		})
+	}
+}
+
+// When another cluster policy with a domain rule still selects the pod, cleanup keeps that domain and
+// the pod's DNS redirection.
+func TestCleanupClusterPolicyPod_RemainingPolicyKeepsDomainRules(t *testing.T) {
+	protocolTCP := corev1.ProtocolTCP
+	var port443 int32 = 443
+	remainingCPE := &policyk8sawsv1.ClusterPolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "remaining-abcde"},
+		Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+			PolicyRef: policyk8sawsv1.ClusterPolicyReference{Name: "remaining"},
+			Tier:      policyk8sawsv1.AdminTier,
+			Priority:  20,
+			Egress: []policyk8sawsv1.ClusterEndpointInfo{{
+				Action:     policyk8sawsv1.ClusterNetworkPolicyRuleActionAccept,
+				DomainName: "aws.com",
+				Ports:      []policyk8sawsv1.Port{{Protocol: &protocolTCP, Port: &port443}},
+			}},
+		},
+	}
+	pod := npatypes.Pod{NamespacedName: types.NamespacedName{Name: "client", Namespace: "cpe-cleanup"}}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	t.Cleanup(func() { filter.DeleteClusterPolicyEndpointDomains(podIdentifier) })
+	assert.NoError(t, filter.SetClusterPolicyEndpointDomains(podIdentifier, []fwrp.EbpfFirewallRules{{DomainName: "deleted.example.com."}}))
+
+	ctrl := gomock.NewController(t)
+	mockClient := mock_client.NewMockClient(ctrl)
+	mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			if cpObj, ok := obj.(*policyk8sawsv1.ClusterPolicyEndpoint); ok {
+				*cpObj = *remainingCPE
+			}
+			return nil
+		},
+	).AnyTimes()
+
+	proxy := &recordingDomainProxy{}
+	r := NewClusterPolicyEndpointsReconciler(mockClient, "", &ebpf.MockBpfClient{}, proxy)
+	r.podIdentifierToClusterPolicyEndpointMap.Store(podIdentifier, []string{remainingCPE.Name})
+	assert.NoError(t, r.cleanupClusterPolicyPod(context.Background(), pod, "deleted-abcde", true))
+
+	ipFilter, ok := filter.GetIPFilter(podIdentifier)
+	assert.True(t, ok)
+	allowed, _ := ipFilter.IsAllowed("aws.com.")
+	assert.True(t, allowed)
+	allowed, _ = ipFilter.IsAllowed("deleted.example.com.")
+	assert.False(t, allowed)
+	assert.Empty(t, proxy.removedPods)
+}

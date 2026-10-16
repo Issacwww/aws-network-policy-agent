@@ -29,9 +29,10 @@ func TestComputeClusterPolicyMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 	nodeIP := "192.168.0.1"
 
 	tests := []struct {
-		name     string
-		rules    []EbpfFirewallRules
-		wantKeys []string
+		name      string
+		rules     []EbpfFirewallRules
+		wantKeys  []string
+		wantPorts map[string][]int
 	}{
 		{
 			name: "invalid CIDR among valid rules",
@@ -55,6 +56,8 @@ func TestComputeClusterPolicyMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 				},
 			},
 			wantKeys: []string{nodeIP + "/32", "10.0.0.0/8", "0.0.0.0/0"},
+			// 10.0.0.0/8 keeps its own TCP 443 and inherits the catch-all of 0.0.0.0/0
+			wantPorts: map[string][]int{"10.0.0.0/8": {443, 0}, "0.0.0.0/0": {0}},
 		},
 		{
 			name: "only an invalid CIDR",
@@ -82,6 +85,9 @@ func TestComputeClusterPolicyMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 			for _, cidr := range tt.wantKeys {
 				assert.Contains(t, got, trieKeyFor(t, cidr), "missing map entry for %s", cidr)
 			}
+			for cidr, ports := range tt.wantPorts {
+				assert.ElementsMatch(t, ports, decodeCPETrieValuePorts(got[trieKeyFor(t, cidr)]), "ports of %s", cidr)
+			}
 		})
 	}
 }
@@ -92,9 +98,10 @@ func TestComputeMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 	nodeIP := "192.168.0.1"
 
 	tests := []struct {
-		name     string
-		rules    []EbpfFirewallRules
-		wantKeys []string
+		name      string
+		rules     []EbpfFirewallRules
+		wantKeys  []string
+		wantPorts map[string][]int
 	}{
 		{
 			name: "invalid CIDR",
@@ -102,14 +109,19 @@ func TestComputeMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 				{IPCidr: "10.0.0.0/8", L4Info: []v1alpha1.Port{{Protocol: &protocolTCP, Port: &port443}}},
 				{IPCidr: "not-a-cidr/32", L4Info: []v1alpha1.Port{{Protocol: &protocolTCP, Port: &port443}}},
 			},
-			wantKeys: []string{nodeIP + "/32", "10.0.0.0/8"},
+			wantKeys:  []string{nodeIP + "/32", "10.0.0.0/8"},
+			wantPorts: map[string][]int{"10.0.0.0/8": {443}},
 		},
 		{
-			name: "invalid except CIDR",
+			// the except entry was meant to exclude addresses, so allowing 0.0.0.0/0 without it would
+			// widen the rule; the whole rule is skipped instead
+			name: "invalid except CIDR drops its rule",
 			rules: []EbpfFirewallRules{
-				{IPCidr: "0.0.0.0/0", Except: []v1alpha1.NetworkAddress{"10.0.0.0/8", "not-a-cidr/24"}},
+				{IPCidr: "0.0.0.0/0", Except: []v1alpha1.NetworkAddress{"10.0.0.0/8", "169.254.169.254/322"}},
+				{IPCidr: "192.168.0.0/16", L4Info: []v1alpha1.Port{{Protocol: &protocolTCP, Port: &port443}}},
 			},
-			wantKeys: []string{nodeIP + "/32", "0.0.0.0/0", "10.0.0.0/8"},
+			wantKeys:  []string{nodeIP + "/32", "192.168.0.0/16"},
+			wantPorts: map[string][]int{"192.168.0.0/16": {443}},
 		},
 	}
 
@@ -124,6 +136,9 @@ func TestComputeMapEntries_InvalidCIDRIsSkipped(t *testing.T) {
 			assert.Len(t, got, len(tt.wantKeys))
 			for _, cidr := range tt.wantKeys {
 				assert.Contains(t, got, trieKeyFor(t, cidr), "missing map entry for %s", cidr)
+			}
+			for cidr, ports := range tt.wantPorts {
+				assert.ElementsMatch(t, ports, decodeTrieValuePorts(got[trieKeyFor(t, cidr)]), "ports of %s", cidr)
 			}
 		})
 	}

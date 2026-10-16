@@ -119,6 +119,13 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 			continue
 		}
 
+		// A malformed except entry cannot be enforced as written; skip the whole rule rather than
+		// allow the addresses that entry was meant to exclude
+		if invalidExcept, found := findInvalidCIDR(firewallRule.Except); found {
+			log().Errorf("Skipping rule %q with invalid except CIDR %q", firewallRule.IPCidr, invalidExcept)
+			continue
+		}
+
 		// Track this rule's except CIDRs to handle later.
 		for _, exceptCidr := range firewallRule.Except {
 			exceptCidrs[string(exceptCidr)] = struct{}{}
@@ -182,6 +189,16 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	}
 
 	return firewallMap, nil
+}
+
+// findInvalidCIDR returns the first entry of cidrs that is not a valid CIDR.
+func findInvalidCIDR(cidrs []v1alpha1.NetworkAddress) (v1alpha1.NetworkAddress, bool) {
+	for _, cidr := range cidrs {
+		if _, _, err := net.ParseCIDR(string(cidr)); err != nil {
+			return cidr, true
+		}
+	}
+	return "", false
 }
 
 // sorting Firewall Rules in Ascending Order of Prefix length

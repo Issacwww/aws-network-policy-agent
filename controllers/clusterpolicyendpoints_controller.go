@@ -387,16 +387,14 @@ func (r *ClusterPolicyEndpointsReconciler) deriveClusterPolicyIngressAndEgressFi
 
 			for _, endPointInfo := range currentCPE.Spec.Egress {
 
-				if r.proxyManager == nil {
-					if endPointInfo.CIDR == "" && endPointInfo.DomainName == "" {
-						log().Warnf("both CIDR and DomainName are empty in PE name %s", currentCPE.Name)
-						continue
-					}
+				if endPointInfo.CIDR == "" && endPointInfo.DomainName == "" {
+					log().Warnf("both CIDR and DomainName are empty in PE name %s", currentCPE.Name)
+					continue
+				}
 
-					if endPointInfo.CIDR == "" {
-						log().Infof("CIDR is empty, skipping the egress rule %s", currentCPE.Name)
-						continue
-					}
+				if endPointInfo.CIDR == "" && r.proxyManager == nil {
+					log().Infof("CIDR is empty, skipping the egress rule %s", currentCPE.Name)
+					continue
 				}
 
 				priority := int(currentCPE.Spec.Priority)

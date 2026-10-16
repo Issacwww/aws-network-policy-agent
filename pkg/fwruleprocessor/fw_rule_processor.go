@@ -107,9 +107,13 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 		// with the other in Go's randomized map-iteration order, producing
 		// non-deterministic port enforcement across reconciliations. Masking here
 		// makes such rules share a key so their ports are merged deterministically.
-		if _, ipNet, err := net.ParseCIDR(string(firewallRule.IPCidr)); err == nil {
-			firewallRule.IPCidr = v1alpha1.NetworkAddress(ipNet.String())
+		_, ipNet, err := net.ParseCIDR(string(firewallRule.IPCidr))
+		if err != nil {
+			// An invalid CIDR matches no traffic; skip it so the other rules are still programmed
+			log().Errorf("Skipping rule with invalid CIDR %q: %v", firewallRule.IPCidr, err)
+			continue
 		}
+		firewallRule.IPCidr = v1alpha1.NetworkAddress(ipNet.String())
 
 		if f.shouldSkipRule(string(firewallRule.IPCidr)) {
 			continue
@@ -147,10 +151,12 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 
 	// Go through except CIDRs and append DENY all rule to the L4 info
 	for exceptCidr := range exceptCidrs {
-		canonicalExcept := exceptCidr
-		if _, ipNet, err := net.ParseCIDR(exceptCidr); err == nil {
-			canonicalExcept = ipNet.String()
+		_, ipNet, err := net.ParseCIDR(exceptCidr)
+		if err != nil {
+			log().Errorf("Skipping invalid except CIDR %q: %v", exceptCidr, err)
+			continue
 		}
+		canonicalExcept := ipNet.String()
 		if _, ok := cidrsMap[canonicalExcept]; !ok {
 			exceptFirewall := EbpfFirewallRules{
 				IPCidr: v1alpha1.NetworkAddress(canonicalExcept),
@@ -314,6 +320,11 @@ func (f *FirewallRuleProcessor) ComputeClusterPolicyMapEntriesFromEndpointRules(
 	for _, rule := range firewallRules {
 
 		cidr := f.normalizeCIDR(string(rule.IPCidr))
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			// An invalid CIDR matches no traffic; skip it so the other rules are still programmed
+			log().Errorf("Skipping cluster policy rule with invalid CIDR %q: %v", rule.IPCidr, err)
+			continue
+		}
 		if f.shouldSkipRule(cidr) {
 			continue
 		}

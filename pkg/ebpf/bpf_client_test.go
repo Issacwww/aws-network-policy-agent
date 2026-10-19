@@ -1116,7 +1116,7 @@ func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	testBpfClient.deletedPods.Store(utils.GetPodNamespacedName(pod.Name, pod.Namespace), time.Now())
 
 	err := testBpfClient.AttacheBPFProbes(pod, utils.GetPodIdentifier(pod.Name, pod.Namespace), 1)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrPodDeleted)
 }
 
 func TestAttacheBPFProbes_ProceedsAfterClearDeletedPod(t *testing.T) {

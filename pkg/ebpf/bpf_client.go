@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,10 +23,12 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/events"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
+	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/aws/aws-network-policy-agent/pkg/utils/cp"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -60,6 +63,8 @@ var (
 	IPAM_JSON_PATH                                   = "/var/run/aws-node/ipam.json"
 	deletedPodsMinAge                                = 5 * time.Minute
 )
+
+var ErrPodDeleted = errors.New("pod has been deleted")
 
 func log() logger.Logger {
 	return logger.Get()
@@ -132,6 +137,7 @@ type BpfClient interface {
 	IsFirstPodInPodIdentifier(podIdentifier string) bool
 	ReAttachEbpfProbes() error
 	GetNetworkPolicyMode() string
+	WriteIPsForPod(podId string, ipsWithTTL []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error
 	CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key int, state int) error
 	ClearDeletedPod(podNamespacedName string)
 	HasBPFContext(podIdentifier string) bool
@@ -161,6 +167,7 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		isMultiNICEnabled:               isMultiNICEnabled,
 		ingressInMemoryMap:              new(sync.Map),
 		egressInMemoryMap:               new(sync.Map),
+		enableIPv6:                      enableIPv6,
 		clusterPolicyIngressInMemoryMap: new(sync.Map),
 		clusterPolicyEgressInMemoryMap:  new(sync.Map),
 		deletedPods:                     new(sync.Map),
@@ -357,6 +364,7 @@ type bpfClient struct {
 	ingressInMemoryMap *sync.Map
 	// This is in-memory map backed by egressBpfMap (key: podIdentifier, value: InMemoryBpfMap pointer)
 	egressInMemoryMap *sync.Map
+	enableIPv6        bool
 	// This is in-memory map backed by clusterPolicyIngressBpfMap (key: podIdentifier, value: InMemoryBpfMap pointer)
 	clusterPolicyIngressInMemoryMap *sync.Map
 	// This is in-memory map backed by clusterPolicyEgressBpfMap (key: podIdentifier, value: InMemoryBpfMap pointer)
@@ -711,6 +719,96 @@ func (l *bpfClient) getInterfaceCountForPod(pod types.NamespacedName, podIdentif
 	return 0, errors.New("Skipping probe attach: multiNIC enabled and interface count is unknown")
 }
 
+func (l *bpfClient) WriteIPsForPod(podId string, ipsWithTTL []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error {
+	value, ok := l.policyEndpointeBPFContext.Load(podId)
+	if !ok {
+		return fmt.Errorf("didn't found bpfcontext for PodIdentifier %s", podId)
+	}
+	peBPFContext := value.(BPFContext)
+	ipCacheBpfMap := peBPFContext.egressPgmInfo.Maps[utils.TC_IPCACHE_MAP]
+
+	log().Debugf("IpCacheBpf Map %+v", ipCacheBpfMap)
+	log().Debugf("writing IPs %v and L4Rules %v", ipsWithTTL, l4Rules)
+
+	nowNs, err := ktimeBootNs()
+	if err != nil {
+		log().Errorf("failed to get boot ns: %v", err)
+		return fmt.Errorf("failed to get boot ns: %w", err)
+	}
+
+	l4RulesBytes := utils.ComputeValueForL4Rules(l4Rules)
+
+	// Loop over all IPs with their individual TTLs and write each one to the eBPF map
+	for _, ipWithTTL := range ipsWithTTL {
+		// Use individual TTL for each IP
+		expiryTime := nowNs + uint64(ipWithTTL.TTL)*uint64(time.Second.Nanoseconds())
+
+		ipCacheVal := npatypes.IPCacheVal{
+			ExpiryTime: expiryTime,
+			Ports:      [npatypes.L4RULE_VALUES_LENGTH]byte(l4RulesBytes),
+		}
+
+		ip := ipWithTTL.IP
+		var key interface{}
+
+		if l.enableIPv6 {
+			// For IPv6, create a 16-byte array key to match the C struct ipcache_key
+			// log().Debugf("writing IPv6 %v into ebpf map (IP %d/%d, TTL: %ds)", ip, i+1, len(ipsWithTTL), ipWithTTL.TTL)
+			ipv6Bytes := ip.To16()
+			if ipv6Bytes == nil {
+				log().Errorf("failed to convert IP %v to IPv6 format, skipping", ip)
+				continue
+			}
+			var ipv6Key [16]byte
+			copy(ipv6Key[:], ipv6Bytes)
+			key = ipv6Key
+		} else {
+			// For IPv4, use uint32 key
+			// log().Debugf("writing IPv4 %v into ebpf map (IP %d/%d, TTL: %ds)", ip, i+1, len(ipsWithTTL), ipWithTTL.TTL)
+			ipv4 := ip.To4()
+			if ipv4 == nil {
+				log().Errorf("failed to convert IP %v to IPv4 format, skipping", ip)
+				continue
+			}
+			key = binary.LittleEndian.Uint32(ipv4)
+		}
+
+		// Create/update map entry with appropriate key type
+		var keyPtr uintptr
+		if l.enableIPv6 {
+			ipv6Key := key.([16]byte)
+			keyPtr = uintptr(unsafe.Pointer(&ipv6Key))
+		} else {
+			ipv4Key := key.(uint32)
+			keyPtr = uintptr(unsafe.Pointer(&ipv4Key))
+		}
+
+		err = ipCacheBpfMap.CreateUpdateMapEntry(keyPtr, uintptr(unsafe.Pointer(&ipCacheVal)), 0)
+		if err != nil {
+			log().Errorf("got err in writing IP %v to ipCache map: %v", ip, err)
+			return fmt.Errorf("got err in writing IP %v to ipCache map: %w", ip, err)
+		}
+
+		// Read back the entry to verify. Only for debugging.
+		// var readVal npatypes.IPCacheVal
+		// if err := ipCacheBpfMap.GetMapEntry(keyPtr, uintptr(unsafe.Pointer(&readVal))); err != nil {
+		// 	log().Errorf("failed to lookup key for IP %v: %v", ip, err)
+		// } else {
+		// 	log().Debugf("read data back for IP %v and got val {Timestamp:%d}", ip, readVal.ExpiryTime)
+		// }
+	}
+
+	return nil
+}
+
+func ktimeBootNs() (uint64, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return 0, err
+	}
+	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec), nil
+}
+
 func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {
 	var ingressProgFD int
 	var egressProgFD int
@@ -719,7 +817,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 
 	if _, deleted := l.deletedPods.Load(podNamespacedName); deleted {
 		log().Debugf("ignoring attaching ebpf probe to pod %s in namespace %s with pod identifier %s as it is already deleted", pod.Name, pod.Namespace, podIdentifier)
-		return nil
+		return ErrPodDeleted
 	}
 
 	// Two go routines can try to attach the probes at the same time
@@ -987,6 +1085,17 @@ func (l *bpfClient) deleteBPFProgramAndMaps(podIdentifier string, direction stri
 		if err != nil {
 			log().Errorf("Failed to delete PodState Map: %v", err)
 		}
+
+		if ipCacheMap, ok := pgmInfo.Maps[utils.TC_IPCACHE_MAP]; ok && direction == "egress" {
+			ipCacheMapPinPath := utils.BPF_MAPS_PIN_PATH_DIRECTORY + podIdentifier + "_" + utils.TC_IPCACHE_MAP
+			err = ipCacheMap.UnPinMap(ipCacheMapPinPath)
+			if err != nil {
+				log().Errorf("failed to delete ip_cache Map: %v", err)
+			} else {
+				log().Debugf("deleted ip_cache_map %s", ipCacheMapPinPath)
+			}
+		}
+
 		err = clusterPolicyMap.UnPinMap(clusterPolicyMapPinpath)
 		if err != nil {
 			log().Errorf("Failed to delete the cluster policy Map: %v", err)

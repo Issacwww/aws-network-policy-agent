@@ -2,7 +2,9 @@ package config
 
 import (
 	"errors"
+	"fmt"
 
+	"github.com/aws/aws-network-policy-agent/pkg/discovery"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 
 	"github.com/spf13/pflag"
@@ -28,6 +30,13 @@ const (
 	flagConntrackCacheCleanupPeriod    = "conntrack-cache-cleanup-period"
 	flagConntrackCacheTableSize        = "conntrack-cache-table-size"
 	flagEnableProfiling                = "enable-profiling"
+	flagDNSPolicyUpstreamSource        = "dns-policy-upstream-source"
+	flagDNSPolicyNftPriority           = "dns-policy-nft-priority"
+	// DNSPolicyNftPriorityEC2 places the DNS redirect DNAT ahead of kube-proxy's Service DNAT (-100),
+	// so a pod's query to the kube-dns Service IP is redirected before kube-proxy rewrites it.
+	DNSPolicyNftPriorityEC2 = -110
+	// DNSPolicyNftPriorityAuto is the standard dstnat priority used by EKS Auto Mode.
+	DNSPolicyNftPriorityAuto = -100
 )
 
 // ControllerConfig contains the controller configuration
@@ -58,6 +67,11 @@ type ControllerConfig struct {
 	RuntimeConfig RuntimeConfig
 	// Configuration for enabling profiling
 	EnableProfiling bool
+	// DNSPolicyUpstreamSource selects where the DNS proxy upstream comes from: discovery.UpstreamSourceKubeDNS
+	// or discovery.UpstreamSourceBottlerocket
+	DNSPolicyUpstreamSource string
+	// DNSPolicyNftPriority is the priority of the nftables chain that redirects pod DNS traffic to the DNS proxy
+	DNSPolicyNftPriority int
 }
 
 func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
@@ -76,6 +90,10 @@ func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&cfg.EnableIPv6, flagEnableIPv6, false, "If enabled, Network Policy agent will operate in IPv6 mode")
 	fs.BoolVar(&cfg.EnableNetworkPolicy, flagEnableNetworkPolicy, false, "If enabled, Network Policy agent will initialize BPF maps and start reconciler")
 	fs.BoolVar(&cfg.EnableProfiling, flagEnableProfiling, false, "If enabled, Network Policy agent will enable profiling")
+	fs.StringVar(&cfg.DNSPolicyUpstreamSource, flagDNSPolicyUpstreamSource, discovery.UpstreamSourceKubeDNS, ""+
+		"Upstream DNS server for the DNS policy proxy - kube-dns (kube-dns Service IP) or bottlerocket (Bottlerocket settings)")
+	fs.IntVar(&cfg.DNSPolicyNftPriority, flagDNSPolicyNftPriority, DNSPolicyNftPriorityEC2, ""+
+		"Priority of the nftables chain that redirects pod DNS traffic to the DNS policy proxy - -110 or -100")
 	fs.IntVar(&cfg.ConntrackCacheCleanupPeriod, flagConntrackCacheCleanupPeriod, defaultConntrackCacheCleanupPeriod, ""+
 		"Cleanup interval for network policy agent conntrack cache")
 	fs.IntVar(&cfg.ConntrackCacheTableSize, flagConntrackCacheTableSize, defaultConntrackCacheTableSize, ""+
@@ -89,6 +107,14 @@ func (cfg *ControllerConfig) ValidControllerFlags() error {
 	// Validate conntrack cache table size
 	if cfg.ConntrackCacheTableSize < (32*1024) || cfg.ConntrackCacheTableSize > (1024*1024) {
 		return errors.New("Invalid conntrack cache table size, should be between 32K and 1024K")
+	}
+	if cfg.DNSPolicyUpstreamSource != discovery.UpstreamSourceKubeDNS && cfg.DNSPolicyUpstreamSource != discovery.UpstreamSourceBottlerocket {
+		return fmt.Errorf("Invalid DNS policy upstream source %q, should be %s or %s", cfg.DNSPolicyUpstreamSource,
+			discovery.UpstreamSourceKubeDNS, discovery.UpstreamSourceBottlerocket)
+	}
+	if cfg.DNSPolicyNftPriority != DNSPolicyNftPriorityEC2 && cfg.DNSPolicyNftPriority != DNSPolicyNftPriorityAuto {
+		return fmt.Errorf("Invalid DNS policy nft priority %d, should be %d or %d", cfg.DNSPolicyNftPriority,
+			DNSPolicyNftPriorityEC2, DNSPolicyNftPriorityAuto)
 	}
 	return nil
 }

@@ -19,13 +19,16 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
+	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,12 +64,14 @@ func clusterPolicyPrometheusRegister() {
 	}
 }
 
-// NewClusterPolicyEndpointsReconciler constructs new ClusterPolicyEndpointReconciler
-func NewClusterPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient) *ClusterPolicyEndpointsReconciler {
+// NewClusterPolicyEndpointsReconciler constructs new ClusterPolicyEndpointReconciler.
+// A nil proxyManager (IPv6 clusters) disables DNS policy: domain egress rules are skipped as before.
+func NewClusterPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, proxyManager proxymanager.ProxyManager) *ClusterPolicyEndpointsReconciler {
 	r := &ClusterPolicyEndpointsReconciler{
 		k8sClient:        k8sClient,
 		nodeIP:           nodeIP,
 		ebpfClient:       ebpfClient,
+		proxyManager:     proxyManager,
 		trackerStartTime: time.Now(),
 	}
 	clusterPolicyPrometheusRegister()
@@ -95,7 +100,8 @@ type ClusterPolicyEndpointsReconciler struct {
 	// Maps ClusterNetworkPolicy to list of selected pod Identifiers
 	clusterNetworkPolicyToPodIdentifierMap sync.Map
 
-	ebpfClient ebpf.BpfClient
+	ebpfClient   ebpf.BpfClient
+	proxyManager proxymanager.ProxyManager
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=clusterpolicyendpoints,verbs=get;list;watch
@@ -251,6 +257,18 @@ func (r *ClusterPolicyEndpointsReconciler) observeClusterPolicyProgrammingLatenc
 
 func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podIdentifier string, targetPods []npatypes.Pod, ingressRules, egressRules []fwrp.EbpfFirewallRules) error {
 
+	domainRules, egressIPRules := fwrp.SegregateDomainAndIPRules(egressRules)
+
+	if r.proxyManager != nil {
+		if len(domainRules) == 0 && filter.HasClusterPolicyEndpointDomains(podIdentifier) {
+			log().Debugf("no domain rules for PodId %s, removing controller domains", podIdentifier)
+			filter.DeleteClusterPolicyEndpointDomains(podIdentifier)
+		} else {
+			// log().Debugf("setting domains for PodId %s : %v", podIdentifier, domainRules)
+			filter.SetClusterPolicyEndpointDomains(podIdentifier, domainRules)
+		}
+	}
+
 	for _, pod := range targetPods {
 		currentPodIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
 		if currentPodIdentifier != podIdentifier {
@@ -258,14 +276,33 @@ func (r *ClusterPolicyEndpointsReconciler) configureClusterPolicyBPFProbes(podId
 		}
 
 		err := r.ebpfClient.AttacheBPFProbes(pod.NamespacedName, podIdentifier, ebpf.INTERFACE_COUNT_UNKNOWN)
+		if errors.Is(err, ebpf.ErrPodDeleted) {
+			continue
+		}
 		if err != nil {
 			log().Errorf("Failed to attach eBPF probes for pod %s namespace %s : %v", pod.Name, pod.Namespace, err)
 			return err
 		}
 		log().Infof("Successfully attached required eBPF probes for pod: %s in namespace %s", pod.Name, pod.Namespace)
+
+		if r.proxyManager == nil {
+			continue
+		}
+		if len(domainRules) != 0 {
+			err = r.proxyManager.AddDNSRedirectionRulesForPod(pod, podIdentifier)
+			if err != nil {
+				log().Errorf("got err in redirecting pod DNS traffic %v", err)
+				return fmt.Errorf("got err in redirecting pod DNS traffic %w", err)
+			}
+		} else {
+			err = r.proxyManager.RemoveDNSRedirectionRulesForPod(pod.NamespacedName, podIdentifier)
+			if err != nil {
+				log().Errorf("got err in removing DNS redirection rules for pod %s: %v", pod.NamespacedName.String(), err)
+			}
+		}
 	}
 
-	err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, egressRules)
+	err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, egressIPRules)
 	if err != nil {
 		log().Errorf("cluster policy Map updates failed for podIdentifier %s: %v", podIdentifier, err)
 		return err
@@ -355,7 +392,7 @@ func (r *ClusterPolicyEndpointsReconciler) deriveClusterPolicyIngressAndEgressFi
 					continue
 				}
 
-				if endPointInfo.CIDR == "" {
+				if endPointInfo.CIDR == "" && r.proxyManager == nil {
 					log().Infof("CIDR is empty, skipping the egress rule %s", currentCPE.Name)
 					continue
 				}
@@ -471,12 +508,19 @@ func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.C
 			log().Errorf("Error Parsing cluster policy Endpoint resource %s: %v", clusterPolicyEndpoint, err)
 			return err
 		}
-		if err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, egressRules); err != nil {
+
+		domainRules, ipEgressRules := fwrp.SegregateDomainAndIPRules(egressRules)
+		r.updateClusterPolicyDomainRules(targetPod, podIdentifier, domainRules)
+
+		if err := r.updateClusterPolicyBPFMaps(podIdentifier, ingressRules, ipEgressRules); err != nil {
 			log().Errorf("cluster policy map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
 			return err
 		}
 		return nil
 	}
+
+	// Nothing selects this identifier anymore, so no cluster policy domain rules remain for it.
+	r.updateClusterPolicyDomainRules(targetPod, podIdentifier, nil)
 
 	// Nothing selects this identifier anymore; clear its eBPF maps. Skip if probes
 	// were already detached — UpdateClusterPolicyEbpfMaps would fail without context.
@@ -490,6 +534,23 @@ func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.C
 		return err
 	}
 	return nil
+}
+
+// updateClusterPolicyDomainRules applies the cluster policy domain rules left for podIdentifier after a
+// cleanup, and removes the pod's DNS redirection once none are left. No-op when DNS policy is not active.
+func (r *ClusterPolicyEndpointsReconciler) updateClusterPolicyDomainRules(targetPod npatypes.Pod, podIdentifier string, clusterPolicyDomainRules []fwrp.EbpfFirewallRules) {
+	if r.proxyManager == nil {
+		return
+	}
+	// check if no domain rules against this pod from any CNP, then remove the DNS traffic re-direction rule
+	if len(clusterPolicyDomainRules) == 0 && filter.HasClusterPolicyEndpointDomains(podIdentifier) {
+		log().Debugf("no domain rules for PodId %s, removing DNS routing, PodIP mapping and domains", podIdentifier)
+		filter.DeleteClusterPolicyEndpointDomains(podIdentifier)
+		r.proxyManager.RemoveDNSRedirectionRulesForPod(targetPod.NamespacedName, podIdentifier)
+	} else {
+		// log().Debugf("setting domains for PodId %s : %v", podIdentifier, domainRules)
+		filter.SetClusterPolicyEndpointDomains(podIdentifier, clusterPolicyDomainRules)
+	}
 }
 
 // commitClusterPolicyEndpointState updates the two maps derive left untouched. Runs only

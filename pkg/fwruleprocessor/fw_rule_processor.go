@@ -90,6 +90,10 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	for _, firewallRule := range firewallRules {
 		var cidrL4Info []v1alpha1.Port
 
+		if firewallRule.IPCidr == "" {
+			log().Warn("Skipping emtpy IP CIDR in rule processing")
+			continue
+		}
 		if !strings.Contains(string(firewallRule.IPCidr), "/") {
 			firewallRule.IPCidr += v1alpha1.NetworkAddress(f.hostMask)
 		}
@@ -103,11 +107,22 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 		// with the other in Go's randomized map-iteration order, producing
 		// non-deterministic port enforcement across reconciliations. Masking here
 		// makes such rules share a key so their ports are merged deterministically.
-		if _, ipNet, err := net.ParseCIDR(string(firewallRule.IPCidr)); err == nil {
-			firewallRule.IPCidr = v1alpha1.NetworkAddress(ipNet.String())
+		_, ipNet, err := net.ParseCIDR(string(firewallRule.IPCidr))
+		if err != nil {
+			// An invalid CIDR matches no traffic; skip it so the other rules are still programmed
+			log().Errorf("Skipping rule with invalid CIDR %q: %v", firewallRule.IPCidr, err)
+			continue
 		}
+		firewallRule.IPCidr = v1alpha1.NetworkAddress(ipNet.String())
 
 		if f.shouldSkipRule(string(firewallRule.IPCidr)) {
+			continue
+		}
+
+		// A malformed except entry cannot be enforced as written; skip the whole rule rather than
+		// allow the addresses that entry was meant to exclude
+		if invalidExcept, found := findInvalidCIDR(firewallRule.Except); found {
+			log().Errorf("Skipping rule %q with invalid except CIDR %q", firewallRule.IPCidr, invalidExcept)
 			continue
 		}
 
@@ -143,10 +158,12 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 
 	// Go through except CIDRs and append DENY all rule to the L4 info
 	for exceptCidr := range exceptCidrs {
-		canonicalExcept := exceptCidr
-		if _, ipNet, err := net.ParseCIDR(exceptCidr); err == nil {
-			canonicalExcept = ipNet.String()
+		_, ipNet, err := net.ParseCIDR(exceptCidr)
+		if err != nil {
+			log().Errorf("Skipping invalid except CIDR %q: %v", exceptCidr, err)
+			continue
 		}
+		canonicalExcept := ipNet.String()
 		if _, ok := cidrsMap[canonicalExcept]; !ok {
 			exceptFirewall := EbpfFirewallRules{
 				IPCidr: v1alpha1.NetworkAddress(canonicalExcept),
@@ -172,6 +189,16 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	}
 
 	return firewallMap, nil
+}
+
+// findInvalidCIDR returns the first entry of cidrs that is not a valid CIDR.
+func findInvalidCIDR(cidrs []v1alpha1.NetworkAddress) (v1alpha1.NetworkAddress, bool) {
+	for _, cidr := range cidrs {
+		if _, _, err := net.ParseCIDR(string(cidr)); err != nil {
+			return cidr, true
+		}
+	}
+	return "", false
 }
 
 // sorting Firewall Rules in Ascending Order of Prefix length
@@ -310,6 +337,11 @@ func (f *FirewallRuleProcessor) ComputeClusterPolicyMapEntriesFromEndpointRules(
 	for _, rule := range firewallRules {
 
 		cidr := f.normalizeCIDR(string(rule.IPCidr))
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			// An invalid CIDR matches no traffic; skip it so the other rules are still programmed
+			log().Errorf("Skipping cluster policy rule with invalid CIDR %q: %v", rule.IPCidr, err)
+			continue
+		}
 		if f.shouldSkipRule(cidr) {
 			continue
 		}
@@ -468,4 +500,22 @@ func isIPv6(cidr string) bool {
 		ip = net.ParseIP(cidr)
 	}
 	return ip != nil && ip.To4() == nil
+}
+
+// SegregateDomainAndIPRules separates egress rules into domain-based and IP-based rules.
+// Domain names are normalized to FQDN format (trailing dot).
+func SegregateDomainAndIPRules(egressRules []EbpfFirewallRules) (domainRules, ipEgressRules []EbpfFirewallRules) {
+	domainRules = []EbpfFirewallRules{}
+	ipEgressRules = []EbpfFirewallRules{}
+	for _, egressRule := range egressRules {
+		if egressRule.DomainName == "" {
+			ipEgressRules = append(ipEgressRules, egressRule)
+		} else {
+			if !strings.HasSuffix(egressRule.DomainName, ".") {
+				egressRule.DomainName = egressRule.DomainName + "."
+			}
+			domainRules = append(domainRules, egressRule)
+		}
+	}
+	return domainRules, ipEgressRules
 }

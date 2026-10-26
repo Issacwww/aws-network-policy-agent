@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-poc
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: harness
+  namespace: dns-poc
+---
+# Disposable kind environment ONLY. Production uses the existing component RBAC.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dns-poc-harness
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: harness
+  namespace: dns-poc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: policy-controller
+  namespace: dns-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: policy-controller}
+  template:
+    metadata:
+      labels: {app: policy-controller}
+    spec:
+      serviceAccountName: harness
+      containers:
+      - name: controller
+        image: dns-policy-poc:local
+        imagePullPolicy: Never
+        command: [/policy-controller]
+        args: [--enable-configmap-check=false]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: npa
+  namespace: dns-poc
+spec:
+  selector:
+    matchLabels: {app: npa}
+  template:
+    metadata:
+      labels: {app: npa}
+    spec:
+      hostNetwork: true
+      serviceAccountName: harness
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: npa
+        image: dns-policy-poc:local
+        imagePullPolicy: Never
+        command: [/bin/sh, -c]
+        args:
+        - /adapter & exec /controller --enable-network-policy=true --log-file= --log-level=info
+        env:
+        - name: DNS_POLICY_INTERCEPTION
+          value: dnat
+        - name: AWS_EC2_METADATA_SERVICE_ENDPOINT
+          value: http://127.0.0.1:18080
+        - name: NODE_IP
+          valueFrom:
+            fieldRef: {fieldPath: status.hostIP}
+        securityContext: {privileged: true}
+        volumeMounts:
+        - {name: bpf, mountPath: /sys/fs/bpf}
+        - {name: binaries, mountPath: /host/opt/cni/bin}
+        - {name: run, mountPath: /var/run/aws-node}
+      volumes:
+      - name: bpf
+        hostPath: {path: /sys/fs/bpf, type: Directory}
+      - name: binaries
+        emptyDir: {}
+      - name: run
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resolver
+  namespace: dns-poc
+  labels: {app: resolver}
+spec:
+  containers:
+  - name: resolver
+    image: dns-policy-poc:local
+    imagePullPolicy: Never
+    command: [/fixture]
+    env:
+    - name: POD_IP
+      valueFrom:
+        fieldRef: {fieldPath: status.podIP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resolver
+  namespace: dns-poc
+spec:
+  selector: {app: resolver}
+  ports:
+  - {name: dns-udp, port: 53, targetPort: 53, protocol: UDP}
+  - {name: dns-tcp, port: 53, targetPort: 53, protocol: TCP}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: allowed
+  namespace: dns-poc
+  labels: {client: test, dns-grant: "yes"}
+spec:
+  containers:
+  - name: client
+    image: dns-policy-poc:local
+    imagePullPolicy: Never
+    command: [sleep, infinity]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: blocked
+  namespace: dns-poc
+  labels: {client: test}
+spec:
+  containers:
+  - name: client
+    image: dns-policy-poc:local
+    imagePullPolicy: Never
+    command: [sleep, infinity]

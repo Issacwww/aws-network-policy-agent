@@ -4,702 +4,206 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 
-	"github.com/avast/retry-go"
-	cdnsproxy "github.com/aws/aws-network-policy-agent/pkg/cdns-proxy"
+	"github.com/aws/aws-network-policy-agent/pkg/dnsproxy"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
-	"github.com/google/nftables"
-	"github.com/google/nftables/expr"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-const (
-	// NFT_TABLE_NAME defines the nftables table name for DNS redirection
-	NFT_TABLE_NAME = "dns_redirect"
-	// NFT_CHAIN_NAME defines the nftables chain name for DNS redirection
-	NFT_CHAIN_NAME = "prerouting"
-	// DNSPROXY_INTERFACE_NAME defines the name of the dnsproxy interface
-	DNSPROXY_INTERFACE_NAME = "dnsproxy"
-)
-
-/*
-This proxy manager will be responsible for
-- starting dnsproxy
-- adding/deleting DNS redirection rules per pod for routing DNS traffic to the dns proxy
-
-TODO
-- Implement garbage collection for ip_cache map
-- Refactor to move out NF table related code out and add UT for this proxy manager
-*/
+const table = "dns_policy_poc"
 
 type ProxyManager interface {
-	AddDNSRedirectionRulesForPod(pod npatypes.Pod, podIdentifier string) error
-	RemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error
-	ForceRemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error
+	AddDNSRedirectionRulesForPod(npatypes.Pod, string) error
+	RemoveDNSRedirectionRulesForPod(types.NamespacedName, string) error
+	ForceRemoveDNSRedirectionRulesForPod(types.NamespacedName, string) error
 	HealthCheckDNSProxy() error
 }
-
 type proxyManager struct {
-	log          logger.Logger
-	ebpfClient   ebpf.BpfClient
-	enableIPv6   bool
-	upstreamIP   net.IP
-	upstreamPort int
-	listenerIP   net.IP
-	listenerPort int
-	npMode       string
-	// priority of the nftables prerouting chain that redirects pod DNS traffic
-	nftChainPriority int32
-	// this map stores the actual nftables rules for each pod for deletion and idempotency checks
-	podRules sync.Map // map[string][]*nftables.Rule
-	// this map stores the pod IP for each pod (used for cleanup during force removal)
-	podIPMap sync.Map // map[string]string (podKey -> podIP)
-	// per-pod locks to prevent race conditions
-	podLocks sync.Map // map[string]*sync.Mutex
-	// nftables connection and references
-	nftConn  *nftables.Conn
-	nftTable *nftables.Table
-	nftChain *nftables.Chain
-	initOnce sync.Once
-	// DNS proxy state management
-	dnsProxyStarted  atomic.Bool
-	dnsProxyStartMux sync.Mutex
-	dnsProxyFailed   atomic.Uint64
+	mu      sync.Mutex
+	mode    string
+	server  *dnsproxy.Server
+	cancel  context.CancelFunc
+	pods    map[string]string
+	started bool
+	err     error
 }
 
-// NewProxyManager returns a ProxyManager. nftChainPriority is the priority of the nftables chain that
-// redirects pod DNS traffic to the proxy; EKS Auto Mode uses the dstnat priority -100.
-func NewProxyManager(log logger.Logger, ebpfClient ebpf.BpfClient, enableIPv6 bool, upstreamIP net.IP, upstreamPort int, listenerIP net.IP, listenerPort int, npMode string, nftChainPriority int32) ProxyManager {
-	return &proxyManager{
-		log:              log,
-		ebpfClient:       ebpfClient,
-		enableIPv6:       enableIPv6,
-		upstreamIP:       upstreamIP,
-		upstreamPort:     upstreamPort,
-		listenerIP:       listenerIP,
-		listenerPort:     listenerPort,
-		npMode:           npMode,
-		nftChainPriority: nftChainPriority,
-	}
+// Retain the port's constructor surface; resolver discovery is deliberately unused.
+func NewProxyManager(_ logger.Logger, _ ebpf.BpfClient, _ bool, _ net.IP, _ int, _ net.IP, _ int, _ string, _ int32) ProxyManager {
+	return &proxyManager{mode: os.Getenv("DNS_POLICY_INTERCEPTION"), pods: map[string]string{}}
 }
-
-// startDNSProxy starts the DNS proxy if it hasn't been started yet
-// This is called lazily when the first pod needs DNS redirection
-// If startup fails, subsequent calls will retry the startup
-func (pm *proxyManager) startDNSProxy() error {
-	// Fast path: check if already started successfully
-	if pm.dnsProxyStarted.Load() {
+func run(name string, args ...string) error {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %v: %w: %s", name, args, err, out)
+	}
+	return nil
+}
+func nft(script string) error {
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft: %w: %s", err, out)
+	}
+	return nil
+}
+func (pm *proxyManager) start() error {
+	if pm.started {
 		return nil
 	}
-
-	// Acquire lock to ensure only one goroutine attempts startup at a time
-	pm.dnsProxyStartMux.Lock()
-	defer pm.dnsProxyStartMux.Unlock()
-
-	// Double-check after acquiring lock (another goroutine might have succeeded)
-	if pm.dnsProxyStarted.Load() {
-		return nil
+	if pm.mode != "dnat" && pm.mode != "tproxy" && pm.mode != "hybrid" {
+		return fmt.Errorf("set DNS_POLICY_INTERCEPTION to dnat, tproxy or hybrid")
 	}
-
-	startTime := time.Now()
-	pm.log.Info("Starting DNS proxy...")
-
-	// Set up the dnsproxy interface and assign the listener IP
-	if err := pm.setupDNSProxyInterface(); err != nil {
-		pm.log.Errorf("failed to setup DNSProxy interface: %v", err)
-		return fmt.Errorf("failed to setup DNSProxy interface: %w", err)
+	// Refuse to take ownership of pre-existing experiment state; cleanup is explicit.
+	if exec.Command("nft", "list", "table", "ip", table).Run() == nil {
+		return fmt.Errorf("table %s already exists; inspect and clean up the previous experiment", table)
 	}
-
-	if err := pm.addListenerIPToInterface(); err != nil {
-		pm.log.Errorf("failed to add listener IP to DNSProxy interface: %v", err)
-		return fmt.Errorf("failed to add listener IP to DNSProxy interface: %w", err)
+	var natResolvers []string
+	if pm.mode == "hybrid" {
+		for _, raw := range strings.Split(os.Getenv("DNS_POLICY_DNAT_RESOLVERS"), ",") {
+			ip := net.ParseIP(strings.TrimSpace(raw))
+			if ip == nil || ip.To4() == nil {
+				return fmt.Errorf("hybrid requires explicit IPv4 DNS_POLICY_DNAT_RESOLVERS")
+			}
+			natResolvers = append(natResolvers, ip.String())
+		}
 	}
-
-	// Initialize nftables setup
-	if err := pm.initNftables(); err != nil {
-		pm.log.Errorf("failed to initialize nftables: %v", err)
-		return fmt.Errorf("failed to initialize nftables: %w", err)
-	}
-
-	if err := pm.startCDNSProxy(context.Background(), pm.log, pm.ebpfClient); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	pm.cancel = cancel
+	s, err := dnsproxy.Start(ctx, "0.0.0.0:50052", pm.mode, dnsproxy.Handle)
+	if err != nil {
+		cancel()
 		return err
 	}
-
-	// Perform health check with retries
-	if err := pm.checkDNSProxyHealth(); err != nil {
-		return fmt.Errorf("dns proxy health check failed: %w", err)
-	}
-
-	// Only mark as started if everything succeeded
-	pm.dnsProxyStarted.Store(true)
-	elapsedTime := time.Since(startTime)
-	pm.log.Infof("DNS proxy started successfully in %v", elapsedTime)
-
-	return nil
-}
-
-func (pm *proxyManager) startCDNSProxy(ctx context.Context, log logger.Logger, ebpfClient ebpf.BpfClient) error {
-	// Format addresses for corefile content
-	var upstreamAddrStr, listenerAddrStr string
-
-	if pm.enableIPv6 {
-		// For IPv6, use brackets around the IP
-		upstreamAddrStr = fmt.Sprintf("[%s]:%d", pm.upstreamIP.String(), pm.upstreamPort)
-		listenerAddrStr = fmt.Sprintf("[%s]:%d", pm.listenerIP.String(), pm.listenerPort)
-	} else {
-		// For IPv4, no brackets needed
-		upstreamAddrStr = fmt.Sprintf("%s:%d", pm.upstreamIP.String(), pm.upstreamPort)
-		listenerAddrStr = fmt.Sprintf("%s:%d", pm.listenerIP.String(), pm.listenerPort)
-	}
-	pm.log.Infof("upstreamAddr: %s listenerAddr: %s", upstreamAddrStr, listenerAddrStr)
-
-	// Health endpoint uses listenerIP with listenerPort+1
-	var healthEndpoint string
-	if pm.enableIPv6 {
-		healthEndpoint = fmt.Sprintf("[%s]:%d", pm.listenerIP.String(), pm.listenerPort+1)
-	} else {
-		healthEndpoint = fmt.Sprintf("%s:%d", pm.listenerIP.String(), pm.listenerPort+1)
-	}
-
-	corefileContent := fmt.Sprintf(`.:%d {
-	bind %s
-	health %s
-	log . {
-      class denial error
-    }
-	ipfilter
-	forward . %s
-}`, pm.listenerPort, pm.listenerIP.String(), healthEndpoint, upstreamAddrStr)
-
-	if err := cdnsproxy.NewDNSProxy(log, ebpfClient, pm.enableIPv6, upstreamAddrStr, listenerAddrStr).Start(ctx, corefileContent); err != nil {
-		return fmt.Errorf("error in starting DNS proxy %w", err)
-	}
-
-	return nil
-}
-
-// setupDNSProxyInterface creates the dnsproxy interface using netlink if it doesn't exist
-func (pm *proxyManager) setupDNSProxyInterface() error {
-	// Check if interface already exists
-	link, err := netlink.LinkByName(DNSPROXY_INTERFACE_NAME)
-	if err != nil {
-		// Interface doesn't exist, create it
-		pm.log.Infof("DNSProxy interface does not exist, creating new one...")
-
-		// Create a dummy interface
-		dummy := &netlink.Dummy{
-			LinkAttrs: netlink.LinkAttrs{
-				Name: DNSPROXY_INTERFACE_NAME,
-			},
+	pm.server = s
+	script := "add table ip " + table + "\nadd set ip " + table + " pods { type ifname . ipv4_addr; }\n"
+	if pm.mode == "dnat" || pm.mode == "hybrid" {
+		destination := ""
+		if pm.mode == "hybrid" {
+			script += "add set ip " + table + " nat_resolvers { type ipv4_addr; elements = { " + strings.Join(natResolvers, ", ") + " }; }\n"
+			destination = "ip daddr @nat_resolvers "
 		}
-
-		if err := netlink.LinkAdd(dummy); err != nil {
-			return fmt.Errorf("failed to create DNSProxy interface: %w", err)
-		}
-
-		// Get the newly created link
-		link, err = netlink.LinkByName(DNSPROXY_INTERFACE_NAME)
-		if err != nil {
-			return fmt.Errorf("failed to get DNSProxy interface after creation: %w", err)
+		script += "add chain ip " + table + " pre { type nat hook prerouting priority -110; policy accept; }\nadd rule ip " + table + " pre iifname . ip saddr @pods " + destination + "meta l4proto { udp, tcp } th dport 53 dnat to 169.254.29.53:50052\n"
+		if err = run("ip", "address", "add", "169.254.29.53/32", "dev", "lo"); err != nil {
+			cancel()
+			s.Close()
+			return err
 		}
 	}
-
-	// Bring the interface up
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("failed to bring up DNSProxy interface: %w", err)
-	}
-
-	pm.log.Infof("DNSProxy interface %s is ready", DNSPROXY_INTERFACE_NAME)
-	return nil
-}
-
-// addListenerIPToInterface adds the listener IP to the dnsproxy interface using netlink
-func (pm *proxyManager) addListenerIPToInterface() error {
-	// Get the interface
-	link, err := netlink.LinkByName(DNSPROXY_INTERFACE_NAME)
-	if err != nil {
-		return fmt.Errorf("failed to get DNSProxy interface: %w", err)
-	}
-
-	// Create the IP address with appropriate prefix length
-	var prefixLen int
-	if pm.enableIPv6 {
-		prefixLen = 128
-	} else {
-		prefixLen = 32
-	}
-
-	addr := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   pm.listenerIP,
-			Mask: net.CIDRMask(prefixLen, prefixLen),
-		},
-	}
-
-	// Add the address to the interface
-	err = netlink.AddrAdd(link, addr)
-	if err != nil {
-		// Check if the address already exists
-		if err.Error() == "file exists" {
-			pm.log.Infof("IP address %s already exists on %s interface", pm.listenerIP.String(), DNSPROXY_INTERFACE_NAME)
-			return nil
+	if pm.mode != "dnat" {
+		if err = run("ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "2053"); err != nil {
+			cancel()
+			s.Close()
+			return err
 		}
-		return fmt.Errorf("failed to add IP address %s to %s interface: %w", pm.listenerIP.String(), DNSPROXY_INTERFACE_NAME, err)
+		if err = run("ip", "rule", "add", "priority", "1053", "fwmark", "0x20000000/0x20000000", "lookup", "2053"); err != nil {
+			cancel()
+			s.Close()
+			run("ip", "route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", "2053")
+			return err
+		}
+		// Keep this transparent client leg out of later kube-proxy Service NAT.
+		// Only intercepted Pod DNS and its replies are untracked; upstream sockets
+		// use the normal node routing/Service translation path.
+		transparentDest := ""
+		if pm.mode == "hybrid" {
+			transparentDest = "ip daddr != @nat_resolvers "
+		}
+		script += "add chain ip " + table + " rawpre { type filter hook prerouting priority -310; policy accept; }\nadd rule ip " + table + " rawpre iifname . ip saddr @pods " + transparentDest + "meta l4proto { udp, tcp } th dport 53 notrack\n"
+		script += "add chain ip " + table + " rawout { type filter hook output priority -310; policy accept; }\nadd rule ip " + table + " rawout oifname . ip daddr @pods meta l4proto { udp, tcp } th sport 53 notrack\n"
+		script += "add chain ip " + table + " transparent { type filter hook prerouting priority -150; policy accept; }\nadd rule ip " + table + " transparent iifname . ip saddr @pods " + transparentDest + "meta l4proto { udp, tcp } th dport 53 tproxy to :50052 meta mark set meta mark | 0x20000000 accept\n"
 	}
-
-	pm.log.Infof("Successfully added IP address %s to %s interface", pm.listenerIP.String(), DNSPROXY_INTERFACE_NAME)
-	return nil
-}
-
-// initNftables initializes the nftables table and chain for DNS redirection
-func (pm *proxyManager) initNftables() error {
-	var err error
-	pm.initOnce.Do(func() {
-		pm.nftConn = &nftables.Conn{}
-
-		// Determine table family based on IPv6 enablement
-		var tableFamily nftables.TableFamily
-		var tableName string
-		if pm.enableIPv6 {
-			tableFamily = nftables.TableFamilyIPv6
-			tableName = "ip6 " + NFT_TABLE_NAME
-			pm.log.Infof("Initializing IPv6 nftables table: %s", tableName)
-		} else {
-			tableFamily = nftables.TableFamilyIPv4
-			tableName = "ip " + NFT_TABLE_NAME
-			pm.log.Infof("Initializing IPv4 nftables table: %s", tableName)
-		}
-
-		// Check if table already exists
-		tables, listErr := pm.nftConn.ListTables()
-		if listErr != nil {
-			pm.log.Warnf("Failed to list existing nftables tables: %v", listErr)
-		} else {
-			for _, table := range tables {
-				if table.Name == NFT_TABLE_NAME && table.Family == tableFamily {
-					pm.log.Infof("Table %s already exists, cleaning all rules", tableName)
-					// Delete the existing table (this removes all chains and rules)
-					pm.nftConn.DelTable(table)
-					if flushErr := pm.nftConn.Flush(); flushErr != nil {
-						pm.log.Warnf("Failed to delete existing table: %v", flushErr)
-					} else {
-						pm.log.Infof("Successfully cleaned existing table %s", tableName)
-					}
-					break
-				}
-			}
-		}
-
-		// Create table with appropriate family
-		pm.nftTable = pm.nftConn.AddTable(&nftables.Table{
-			Family: tableFamily,
-			Name:   NFT_TABLE_NAME,
-		})
-
-		// Create prerouting chain
-		pm.log.Infof("Using nftables %s chain priority %d", NFT_CHAIN_NAME, pm.nftChainPriority)
-		pm.nftChain = pm.nftConn.AddChain(&nftables.Chain{
-			Name:     NFT_CHAIN_NAME,
-			Table:    pm.nftTable,
-			Type:     nftables.ChainTypeNAT,
-			Hooknum:  nftables.ChainHookPrerouting,
-			Priority: nftables.ChainPriorityRef(nftables.ChainPriority(pm.nftChainPriority)),
-		})
-
-		// Flush the initial setup
-		err = pm.nftConn.Flush()
-		if err != nil {
-			pm.log.Errorf("Failed to initialize nftables: %v", err)
-		} else {
-			pm.log.Infof("Successfully initialized nftables table and chain for %s", tableName)
-		}
-	})
-	return err
-}
-
-// getPodLock gets or creates a mutex for the given pod
-func (pm *proxyManager) getPodLock(podKey string) *sync.Mutex {
-	lockInterface, _ := pm.podLocks.LoadOrStore(podKey, &sync.Mutex{})
-	return lockInterface.(*sync.Mutex)
-}
-
-// AddDNSRedirectionRulesForPod adds nftables rules for a specific pod's veth interface
-func (pm *proxyManager) AddDNSRedirectionRulesForPod(pod npatypes.Pod, podIdentifier string) error {
-	// Start DNS proxy if not already started
-	if !pm.dnsProxyStarted.Load() {
-		if err := pm.startDNSProxy(); err != nil {
-			pm.dnsProxyFailed.Add(1)
-			return fmt.Errorf("failed to start DNS proxy: %w", err)
-		}
-	}
-
-	// Get the lock for this pod to prevent race conditions
-	podLock := pm.getPodLock(pod.String())
-	podLock.Lock()
-	defer podLock.Unlock()
-
-	// Check if rules already exist for this pod (idempotency check under lock)
-	if _, exists := pm.podRules.Load(pod.String()); exists {
-		pm.log.Debugf("nftables rules already exist for pod %s, skipping", pod.NamespacedName.String())
-		return nil
-	}
-
-	filter.SetPodIPToPodId(string(pod.PodIP), podIdentifier)
-	pm.podIPMap.Store(pod.NamespacedName.String(), string(pod.PodIP))
-
-	hostVethName, err := utils.GetHostVethName(pod.Name, pod.Namespace, 0, []string{ebpf.POD_VETH_PREFIX, ebpf.BRANCH_ENI_VETH_PREFIX})
-	if err != nil {
-		pm.log.Warnf("Failed to get veth name for pod %s in namespace %s. Pod might have been deleted", pod.Name, pod.Namespace)
+	if err = nft(script); err != nil {
+		cancel()
+		s.Close()
+		pm.cleanupRouting()
 		return err
 	}
-
-	// Add nftables rules for IPv4 and store rule references
-	rules, err := pm.addNftRulesForInterface(hostVethName)
-	if err != nil {
-		return fmt.Errorf("failed to add nftables rules: %w", err)
-	}
-
-	pm.podRules.Store(pod.String(), rules)
-	pm.log.Infof("Added nftables rules for pod %s with veth interface %s", pod.NamespacedName.String(), hostVethName)
-
+	pm.started = true
 	return nil
 }
-
-// addNftRulesForInterface adds nftables rules for DNS traffic redirection for a specific interface
-func (pm *proxyManager) addNftRulesForInterface(interfaceName string) ([]*nftables.Rule, error) {
-	pm.log.Infof("Adding nftables rules for interface %s", interfaceName)
-
-	// Prepare destination address and NAT family based on IP version
-	var destAddr []byte
-	var natFamily uint32
-	var protocolOffset uint32
-
-	if pm.enableIPv6 {
-		destAddr = pm.listenerIP.To16()
-		natFamily = uint32(nftables.TableFamilyIPv6)
-		protocolOffset = 6 // Next Header field offset in IPv6 header
-	} else {
-		destAddr = pm.listenerIP.To4()
-		natFamily = uint32(nftables.TableFamilyIPv4)
-		protocolOffset = 9 // Protocol field offset in IPv4 header
+func (pm *proxyManager) cleanupRouting() {
+	if pm.mode == "dnat" || pm.mode == "hybrid" {
+		run("ip", "address", "del", "169.254.29.53/32", "dev", "lo")
 	}
-
-	// UDP rule
-	udpRule := &nftables.Rule{
-		Table: pm.nftTable,
-		Chain: pm.nftChain,
-		Exprs: []expr.Any{
-			// Match specific interface
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte(interfaceName),
-			},
-			// Match UDP protocol
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       protocolOffset,
-				Len:          1,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{unix.IPPROTO_UDP},
-			},
-			// Match destination port 53
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       2,
-				Len:          2,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{0, 53},
-			},
-			// DNAT
-			&expr.Immediate{
-				Register: 1,
-				Data:     destAddr,
-			},
-			&expr.Immediate{
-				Register: 2,
-				Data:     []byte{uint8(pm.listenerPort >> 8), uint8(pm.listenerPort & 0xff)},
-			},
-			&expr.NAT{
-				Type:        expr.NATTypeDestNAT,
-				Family:      natFamily,
-				RegAddrMin:  1,
-				RegProtoMin: 2,
-			},
-		},
+	if pm.mode != "dnat" {
+		run("ip", "rule", "del", "priority", "1053", "fwmark", "0x20000000/0x20000000", "lookup", "2053")
+		run("ip", "route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", "2053")
 	}
-
-	// TCP rule
-	tcpRule := &nftables.Rule{
-		Table: pm.nftTable,
-		Chain: pm.nftChain,
-		Exprs: []expr.Any{
-			// Match specific interface
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte(interfaceName),
-			},
-			// Match TCP protocol
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       protocolOffset,
-				Len:          1,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{unix.IPPROTO_TCP},
-			},
-			// Match destination port 53
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       2,
-				Len:          2,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{0, 53},
-			},
-			// DNAT
-			&expr.Immediate{
-				Register: 1,
-				Data:     destAddr,
-			},
-			&expr.Immediate{
-				Register: 2,
-				Data:     []byte{uint8(pm.listenerPort >> 8), uint8(pm.listenerPort & 0xff)},
-			},
-			&expr.NAT{
-				Type:        expr.NATTypeDestNAT,
-				Family:      natFamily,
-				RegAddrMin:  1,
-				RegProtoMin: 2,
-			},
-		},
+}
+func (pm *proxyManager) Close() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if !pm.started {
+		return
 	}
-
-	pm.nftConn.AddRule(udpRule)
-	pm.nftConn.AddRule(tcpRule)
-
-	// Flush changes to commit rules to kernel
-	if err := pm.nftConn.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush nftables changes: %w", err)
+	run("nft", "delete", "table", "ip", table)
+	pm.cleanupRouting()
+	pm.cancel()
+	pm.server.Close()
+	pm.started = false
+}
+func (pm *proxyManager) AddDNSRedirectionRulesForPod(pod npatypes.Pod, id string) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if err := pm.start(); err != nil {
+		pm.err = err
+		return err
 	}
-
-	// Get the rules from the kernel with their assigned handles
-	chainRules, err := pm.nftConn.GetRules(pm.nftTable, pm.nftChain)
+	ip := net.ParseIP(string(pod.PodIP))
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("IPv4 pod required")
+	}
+	if old := pm.pods[pod.String()]; strings.HasSuffix(old, " . "+ip.String()) {
+		return nil
+	} else if old != "" {
+		return fmt.Errorf("pod address changed before cleanup")
+	}
+	// Only packets arriving from this Pod's VPC-CNI veth may enter its proxy path.
+	iface, err := utils.GetHostVethName(pod.Name, pod.Namespace, 0, []string{ebpf.POD_VETH_PREFIX, ebpf.BRANCH_ENI_VETH_PREFIX})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get rules from kernel: %w", err)
+		return err
 	}
-
-	// Find our rules by matching the interface name in the rule expressions
-	var addedRules []*nftables.Rule
-	for _, rule := range chainRules {
-		if pm.ruleMatchesInterface(rule, interfaceName) {
-			addedRules = append(addedRules, rule)
-		}
+	filter.SetPodIPToPodId(ip.String(), id)
+	if err := nft("add element ip " + table + " pods { " + fmt.Sprintf("%q . %s", iface, ip.String()) + " }"); err != nil {
+		filter.DeletePodIPToPodIdEntry(ip.String())
+		return err
 	}
-
-	if len(addedRules) == 0 {
-		pm.log.Warnf("Could not find added rules for interface %s in kernel", interfaceName)
-		// Return empty slice rather than error to avoid breaking the flow
-		return []*nftables.Rule{}, nil
-	}
-
-	pm.log.Infof("Successfully added %d nftables rules for interface %s", len(addedRules), interfaceName)
-	return addedRules, nil
+	pm.pods[pod.String()] = fmt.Sprintf("%q . %s", iface, ip.String())
+	pm.err = nil
+	return nil
 }
-
-// ruleMatchesInterface checks if a rule matches the given interface name
-func (pm *proxyManager) ruleMatchesInterface(rule *nftables.Rule, interfaceName string) bool {
-	// Look for Meta expression with IIFNAME key followed by Cmp expression with interface name
-	for i, expression := range rule.Exprs {
-		if meta, ok := expression.(*expr.Meta); ok && meta.Key == expr.MetaKeyIIFNAME {
-			// Check if the next expression is a comparison with our interface name
-			if i+1 < len(rule.Exprs) {
-				if cmp, ok := rule.Exprs[i+1].(*expr.Cmp); ok && cmp.Op == expr.CmpOpEq {
-					// Compare the data (interface name)
-					if string(cmp.Data) == interfaceName {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-// RemoveIPTableRulesForPod removes DNS redirection rules for a pod if no controller has domain rules
-// This is called by controllers during policy reconciliation
-// It checks if any controller still has domain rules for the podIdentifier before removing
-func (pm *proxyManager) RemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error {
-	// Get the lock for this pod to prevent race conditions
-	podLock := pm.getPodLock(pod.String())
-	podLock.Lock()
-	defer podLock.Unlock()
-
-	if filter.HasAnyDomainRules(podIdentifier) {
-		pm.log.Infof("Domain rules still exist for podIdentifier %s from other controllers, skipping DNS redirection rule removal for pod %s",
-			podIdentifier, pod.String())
-		return nil // Early return - don't remove rules yet
-	}
-
-	return pm.removeNFTableRulesInternal(pod)
-}
-
-// ForceRemoveIPTableRulesForPod unconditionally removes DNS redirection rules and cleans up all mappings
-// This is called by the RPC handler when a pod is being deleted
-// It does not check for domain rules and always performs cleanup
-func (pm *proxyManager) ForceRemoveDNSRedirectionRulesForPod(pod types.NamespacedName, podIdentifier string) error {
-	podLock := pm.getPodLock(pod.String())
-	podLock.Lock()
-	defer podLock.Unlock()
-
-	podKey := pod.String()
-	pm.log.Infof("ForceRemoveIPTableRulesForPod called for pod %s (podIdentifier: %s) - unconditional removal", podKey, podIdentifier)
-
-	// Lookup pod IP from our internal map
-	var podIP string
-	if podIPInterface, exists := pm.podIPMap.Load(podKey); exists {
-		podIP = podIPInterface.(string)
-		pm.log.Debugf("Found pod IP %s for pod %s", podIP, podKey)
-	} else {
-		pm.log.Debugf("Pod IP not found in podIPMap for pod %s, skipping pod IP cleanup", podKey)
+func (pm *proxyManager) RemoveDNSRedirectionRulesForPod(pod types.NamespacedName, id string) error {
+	if filter.HasAnyDomainRules(id) {
 		return nil
 	}
-
-	// Clean up pod IP to pod ID mapping (always do this, even if rule removal fails)
-	if podIP != "" {
-		filter.DeletePodIPToPodIdEntry(podIP)
-		pm.log.Debugf("Cleaned up pod IP to pod ID mapping for pod %s (podIP: %s)", podKey, podIP)
-	}
-
-	// Clean up our internal pod IP mapping
-	pm.podIPMap.Delete(podKey)
-	pm.log.Debugf("Cleaned up internal pod IP mapping for pod %s", podKey)
-
-	// Remove nftables rules
-	return pm.removeNFTableRulesInternal(pod)
+	return pm.ForceRemoveDNSRedirectionRulesForPod(pod, id)
 }
-
-func (pm *proxyManager) removeNFTableRulesInternal(pod types.NamespacedName) error {
-	// Check if we have rules for this pod
-	rulesInterface, exists := pm.podRules.Load(pod.String())
-	if !exists {
-		pm.log.Debugf("No nftables rules found for pod %s, nothing to remove", pod.String())
+func (pm *proxyManager) ForceRemoveDNSRedirectionRulesForPod(pod types.NamespacedName, _ string) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	ip := pm.pods[pod.String()]
+	if ip == "" {
 		return nil
 	}
-
-	rules := rulesInterface.([]*nftables.Rule)
-	pm.log.Infof("Removing %d nftables rules for pod %s", len(rules), pod.String())
-
-	// Delete each rule
-	for _, rule := range rules {
-		if err := pm.nftConn.DelRule(rule); err != nil {
-			pm.log.Warnf("Failed to delete nftables rule for pod %s: %v", pod.String(), err)
-		}
+	if err := nft("delete element ip " + table + " pods { " + ip + " }"); err != nil {
+		return err
 	}
-
-	// Flush the deletions
-	if err := pm.nftConn.Flush(); err != nil {
-		pm.log.Errorf("Failed to flush nftables rule deletions for pod %s: %v", pod.String(), err)
-		return fmt.Errorf("failed to flush nftables rule deletions: %w", err)
-	}
-
-	// Remove the entry from the map
-	pm.podRules.Delete(pod.String())
-	pm.log.Infof("Successfully removed %d nftables rules for pod %s", len(rules), pod.String())
-
+	filter.DeletePodIPToPodIdEntry(strings.Split(ip, " . ")[1])
+	delete(pm.pods, pod.String())
 	return nil
 }
-
-func (pm *proxyManager) checkDNSProxyHealth() error {
-	var healthEndpoint string
-	if pm.enableIPv6 {
-		healthEndpoint = fmt.Sprintf("[%s]:%d", pm.listenerIP.String(), pm.listenerPort+1)
-	} else {
-		healthEndpoint = fmt.Sprintf("%s:%d", pm.listenerIP.String(), pm.listenerPort+1)
-	}
-	healthCheckURL := fmt.Sprintf("http://%s/health", healthEndpoint)
-	client := &http.Client{
-		Timeout: 2 * time.Second, // 2 second timeout for the request
-	}
-
-	var attemptNum uint
-	err := retry.Do(
-		func() error {
-			attemptNum++
-			pm.log.Debugf("Performing DNS proxy health check (attempt %d/3)...", attemptNum)
-
-			resp, err := client.Get(healthCheckURL)
-			if err != nil {
-				pm.log.Warnf("DNS proxy health check attempt %d/3 failed: %v", attemptNum, err)
-				return fmt.Errorf("DNS proxy health check failed: %w", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				pm.log.Warnf("DNS proxy health check attempt %d/3 returned status: %d", attemptNum, resp.StatusCode)
-				return fmt.Errorf("DNS proxy health check returned non-OK status: %d", resp.StatusCode)
-			}
-
-			pm.log.Debugf("DNS proxy health check successful on attempt %d/3 - proxy is ready to serve requests", attemptNum)
-			return nil
-		},
-		retry.Attempts(3),
-		retry.Delay(100*time.Millisecond),
-		retry.DelayType(retry.BackOffDelay),
-		retry.LastErrorOnly(true),
-	)
-
-	if err != nil {
-		pm.log.Errorf("DNS proxy health check failed after 3 attempts: %v", err)
-		return fmt.Errorf("DNS proxy health check failed after 3 attempts: %w", err)
-	}
-
-	return nil
-}
-
-// HealthCheckDNSProxy performs a health check on the DNS proxy
-// If the DNS proxy is started, it makes a health check call
-// If the DNS proxy is not started, it checks if startup has failed once
-// Returns nil (success) if the proxy is healthy
 func (pm *proxyManager) HealthCheckDNSProxy() error {
-	// If DNS proxy is started, perform health check
-	if pm.dnsProxyStarted.Load() {
-		return pm.checkDNSProxyHealth()
-	}
-
-	// If DNS proxy is not started, check failure count and return err if it failed once
-	failedCount := pm.dnsProxyFailed.Load()
-	if failedCount >= 1 {
-		return fmt.Errorf("DNS proxy has not started and has failed %d times", failedCount)
-	}
-
-	// DNS proxy not started - return success
-	return nil
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.err
 }

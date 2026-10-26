@@ -1,0 +1,127 @@
+{
+  "cluster": "dns-poc-ipvs",
+  "resolver": "10.96.252.210",
+  "target": "10.244.0.7",
+  "tests": [
+    {
+      "name": "before DNS denied",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2002 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "UDP DNS original resolver",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 api.poc.test +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 35337\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;api.poc.test.\t\t\tIN\tA\n\n;; ANSWER SECTION:\napi.poc.test.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 11 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:19:25 UTC 2026\n;; MSG SIZE  rcvd: 58"
+    },
+    {
+      "name": "domain allows selected Pod",
+      "pass": true,
+      "exit": 0,
+      "output": "dns-policy-poc-ok"
+    },
+    {
+      "name": "port restriction",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8081 after 2002 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "other Pod denied",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2002 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "TTL expiry denies fresh connection",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2000 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "TCP DNS original resolver",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 api.poc.test +time=2 +tries=1 +tcp\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 36046\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;api.poc.test.\t\t\tIN\tA\n\n;; ANSWER SECTION:\napi.poc.test.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 3 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (TCP)\n;; WHEN: Mon Oct 26 11:19:38 UTC 2026\n;; MSG SIZE  rcvd: 58"
+    },
+    {
+      "name": "TCP DNS grant",
+      "pass": true,
+      "exit": 0,
+      "output": "dns-policy-poc-ok"
+    },
+    {
+      "name": "case insensitive",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 API.POC.TEST +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 56626\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;API.POC.TEST.\t\t\tIN\tA\n\n;; ANSWER SECTION:\nAPI.POC.TEST.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 10 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:19:44 UTC 2026\n;; MSG SIZE  rcvd: 58"
+    },
+    {
+      "name": "case grant",
+      "pass": true,
+      "exit": 0,
+      "output": "dns-policy-poc-ok"
+    },
+    {
+      "name": "deep wildcard",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 a.b.wild.poc.test +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 19266\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;a.b.wild.poc.test.\t\tIN\tA\n\n;; ANSWER SECTION:\na.b.wild.poc.test.\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 8 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:19:51 UTC 2026\n;; MSG SIZE  rcvd: 68"
+    },
+    {
+      "name": "wildcard grant",
+      "pass": true,
+      "exit": 0,
+      "output": "dns-policy-poc-ok"
+    },
+    {
+      "name": "wildcard bare domain resolves",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 wild.poc.test +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1751\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;wild.poc.test.\t\t\tIN\tA\n\n;; ANSWER SECTION:\nwild.poc.test.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 14 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:19:57 UTC 2026\n;; MSG SIZE  rcvd: 60"
+    },
+    {
+      "name": "wildcard excludes bare domain",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2000 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "unmatched DNS still resolves",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 other.poc.test +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 42543\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;other.poc.test.\t\t\tIN\tA\n\n;; ANSWER SECTION:\nother.poc.test.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 5 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:19:59 UTC 2026\n;; MSG SIZE  rcvd: 62"
+    },
+    {
+      "name": "unmatched gives no grant",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2002 ms: Timeout was reached\ncommand terminated with exit code 28"
+    },
+    {
+      "name": "grant before delete",
+      "pass": true,
+      "exit": 0,
+      "output": "; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 api.poc.test +time=2 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 9954\n;; flags: qr rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n;; WARNING: recursion requested but not available\n\n;; QUESTION SECTION:\n;api.poc.test.\t\t\tIN\tA\n\n;; ANSWER SECTION:\napi.poc.test.\t\t5\tIN\tA\t10.244.0.7\n\n;; Query time: 3 msec\n;; SERVER: 10.96.252.210#53(10.96.252.210) (UDP)\n;; WHEN: Mon Oct 26 11:20:02 UTC 2026\n;; MSG SIZE  rcvd: 58"
+    },
+    {
+      "name": "grant before delete works",
+      "pass": true,
+      "exit": 0,
+      "output": "dns-policy-poc-ok"
+    },
+    {
+      "name": "delete policy",
+      "pass": true,
+      "exit": 0,
+      "output": "applicationnetworkpolicy.networking.k8s.aws \"domains\" deleted"
+    },
+    {
+      "name": "policy deletion revokes fresh connection",
+      "pass": true,
+      "exit": 28,
+      "output": "curl: (28) Failed to connect to 10.244.0.7 port 8080 after 2002 ms: Timeout was reached\ncommand terminated with exit code 28"
+    }
+  ]
+}

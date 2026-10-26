@@ -1,0 +1,29 @@
+{
+  "cluster": "dns-poc-ipvs",
+  "tests": [
+    {
+      "resolver": "10.96.252.210",
+      "transport": "udp",
+      "pass": true,
+      "output": ";; communications error to 10.96.252.210#53: timed out\n\n; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @10.96.252.210 api.poc.test +time=1 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; no servers could be reached\ncommand terminated with exit code 9\n"
+    },
+    {
+      "resolver": "10.96.252.210",
+      "transport": "tcp",
+      "pass": true,
+      "output": ";; Connection to 10.96.252.210#53(10.96.252.210) for api.poc.test failed: timed out.\n;; no servers could be reached\ncommand terminated with exit code 9\n"
+    },
+    {
+      "resolver": "169.254.20.10",
+      "transport": "udp",
+      "pass": true,
+      "output": ";; communications error to 169.254.20.10#53: timed out\n\n; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @169.254.20.10 api.poc.test +time=1 +tries=1\n; (1 server found)\n;; global options: +cmd\n;; no servers could be reached\ncommand terminated with exit code 9\n"
+    },
+    {
+      "resolver": "169.254.20.10",
+      "transport": "tcp",
+      "pass": true,
+      "output": ";; Connection to 169.254.20.10#53(169.254.20.10) for api.poc.test failed: timed out.\n;; no servers could be reached\ncommand terminated with exit code 9\n"
+    }
+  ]
+}

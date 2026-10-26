@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: transport-only
+  namespace: dns-poc
+spec:
+  podSelector:
+    matchLabels: {client: test}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock: {cidr: 0.0.0.0/0}
+    ports:
+    - {port: 53, protocol: UDP}
+    - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: domains
+  namespace: dns-poc
+spec:
+  podSelector:
+    matchLabels: {dns-grant: "yes"}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - domainNames: [api.poc.test, '*.wild.poc.test']
+    ports:
+    - {port: 8080, protocol: TCP}

@@ -1,0 +1,3 @@
+FROM kindest/node@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+RUN apt-get update && apt-get install -y --no-install-recommends clang llvm libbpf-dev bpftool gcc make dnsutils curl python3 tcpdump ipvsadm && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT []

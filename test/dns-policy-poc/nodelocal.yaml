@@ -1,0 +1,51 @@
+# Real NodeLocal DNSCache; replace __UPSTREAM__ with the fixture Service IP.
+# Local-address topology (also used with IPVS), not Service-IP co-binding.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodelocal
+  namespace: dns-poc
+data:
+  Corefile: |
+    .:53 {
+      errors
+      bind 169.254.20.10
+      cache 30
+      forward . __UPSTREAM__ {
+        force_tcp
+      }
+      health 169.254.20.10:8080
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nodelocal
+  namespace: dns-poc
+spec:
+  selector:
+    matchLabels: {app: nodelocal}
+  template:
+    metadata:
+      labels: {app: nodelocal}
+    spec:
+      hostNetwork: true
+      dnsPolicy: Default
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: cache
+        image: registry.k8s.io/dns/k8s-dns-node-cache:1.27.1
+        imagePullPolicy: IfNotPresent
+        args: [-localip, "169.254.20.10", -basecorefile, /config/Corefile, -conf, /etc/Corefile, -upstreamsvc, resolver]
+        securityContext:
+          capabilities:
+            add: [NET_ADMIN]
+        volumeMounts:
+        - {name: config, mountPath: /config}
+        - {name: lock, mountPath: /run/xtables.lock}
+      volumes:
+      - name: config
+        configMap: {name: nodelocal}
+      - name: lock
+        hostPath: {path: /run/xtables.lock, type: FileOrCreate}

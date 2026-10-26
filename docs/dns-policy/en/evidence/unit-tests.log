@@ -1,0 +1,6 @@
+ok  	github.com/aws/aws-network-policy-agent/pkg/dnsproxy	1.497s
+ok  	github.com/aws/aws-network-policy-agent/pkg/filter	1.455s
+ok  	github.com/aws/aws-network-policy-agent/pkg/utils	1.373s
+?   	github.com/aws/aws-network-policy-agent/pkg/proxymanager	[no test files]
+ok  	github.com/aws/aws-network-policy-agent/controllers	1.531s
+ok  	github.com/aws/aws-network-policy-agent/pkg/rpc	1.387s

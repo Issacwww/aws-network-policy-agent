@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -181,6 +182,9 @@ func GetPodIdentifier(podName, podNamespace string) string {
 	if strings.Contains(podName, ".") {
 		log().Debug("Replacing '.' character with '_' for pod pin path.")
 		podName = strings.Replace(podName, ".", "_", -1)
+	}
+	if os.Getenv("DNS_POLICY_INTERCEPTION") != "" {
+		return podName + "@" + podNamespace
 	}
 	podIdentifierPrefix := podName
 	if strings.Contains(podName, "-") {

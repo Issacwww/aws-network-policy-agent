@@ -26,7 +26,7 @@ import (
 	"time"
 
 	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
-	dnsDiscovery "github.com/aws/aws-network-policy-agent/pkg/discovery"
+
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	"github.com/aws/aws-network-policy-agent/pkg/filter"
 	"github.com/aws/aws-network-policy-agent/pkg/proxymanager"
@@ -140,10 +140,18 @@ func main() {
 
 		// When DNS policy cannot run, proxyManager stays nil and the controllers skip domainName
 		// entries, as before DNS policy support. The rest of the policies are still enforced.
-		upstreamIP, enableDNSPolicy, dnsPolicyOffReason := dnsDiscovery.ResolveDNSPolicyUpstream(ctrlConfig.DNSPolicyUpstreamSource, ctrlConfig.EnableIPv6)
-		if !enableDNSPolicy {
-			log.Errorf("DNS policy is disabled, domainName egress rules are ignored: %s", dnsPolicyOffReason)
+		// Explicitly opt in: this is an IPv4 transport experiment, not a released feature.
+		interception := os.Getenv("DNS_POLICY_INTERCEPTION")
+		enableDNSPolicy := interception == "dnat" || interception == "tproxy" || interception == "hybrid"
+		if interception != "" && !enableDNSPolicy {
+			log.Errorf("invalid DNS_POLICY_INTERCEPTION")
+			os.Exit(1)
 		}
+		if enableDNSPolicy && ctrlConfig.EnableIPv6 {
+			log.Errorf("DNS POC requires IPv4")
+			os.Exit(1)
+		}
+		upstreamIP := net.IP(nil)
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
 			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
@@ -153,14 +161,14 @@ func main() {
 			filter.BpfClient = ebpfClient
 			filter.IsIPv6 = ctrlConfig.EnableIPv6
 
-			listenerIP := net.ParseIP("169.254.20.10")
+			listenerIP := net.ParseIP("169.254.29.53")
 			upstreamPort := 53
 			listenerPort := 50052
-			log.Infof("DNS policy is enabled: proxy upstream %s:%d (source %s), listener %s:%d, nftables chain priority %d",
-				upstreamIP, upstreamPort, ctrlConfig.DNSPolicyUpstreamSource, listenerIP, listenerPort, ctrlConfig.DNSPolicyNftPriority)
+			log.Infof("DNS POC enabled: interception=%s, original resolver forwarding, listener port=%d", interception, listenerPort)
 
 			proxyManager = proxymanager.NewProxyManager(log, ebpfClient, ctrlConfig.EnableIPv6, upstreamIP, upstreamPort, listenerIP, listenerPort, npMode,
 				int32(ctrlConfig.DNSPolicyNftPriority))
+			defer proxyManager.(interface{ Close() }).Close()
 		}
 
 		policyEndpointController = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6, proxyManager)

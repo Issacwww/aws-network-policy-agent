@@ -31,6 +31,9 @@ type Filter struct {
 // Input domain is always a FQDN, never contains "*"
 // Returns whether the domain is allowed and the associated L4Info
 func (f *Filter) IsAllowed(domain string) (bool, []npatypes.L4Rule) {
+	if domain != "" {
+		domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	}
 	// Input validation
 	if domain == "" {
 		return false, []npatypes.L4Rule{}
@@ -43,6 +46,12 @@ func (f *Filter) IsAllowed(domain string) (bool, []npatypes.L4Rule) {
 		}
 	}
 
+	if matchNames := f.matchName.Load(); matchNames != nil {
+		if rules, ok := (*matchNames)[domain+"."]; ok {
+			return true, rules
+		}
+	}
+
 	// Then, check if FQDN matches any wildcard patterns in MatchPattern
 	if matchPatterns := f.matchPattern.Load(); matchPatterns != nil {
 		for pattern, l4Rules := range *matchPatterns {
@@ -52,7 +61,7 @@ func (f *Filter) IsAllowed(domain string) (bool, []npatypes.L4Rule) {
 				continue
 			}
 
-			if matchWildcardPattern(pattern, domain) {
+			if matchWildcardPattern(strings.TrimSuffix(pattern, "."), domain) {
 				return true, l4Rules
 			}
 		}

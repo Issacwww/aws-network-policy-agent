@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -11,6 +12,14 @@ import (
 // SetPolicyEndpointDomains sets domains from PolicyEndpointController
 // PolicyEndpointController will pass domainNames, there is no real meaning of Priority or Action for these
 func SetPolicyEndpointDomains(podIdentifier string, domainFWRules []fwrp.EbpfFirewallRules) error {
+	PolicyMu.Lock()
+	defer PolicyMu.Unlock()
+	if c, ok := BpfClient.(interface{ ClearDNSForPod(string) error }); ok {
+		if err := c.ClearDNSForPod(podIdentifier); err != nil {
+			return fmt.Errorf("invalidate DNS grants: %w", err)
+		}
+	}
+
 	dnsProxyRules := ComputeDNSProxyRulesFromEbpfFirewallRulesForPE(domainFWRules)
 	log().Debugf("DNS proxy rules for PodId %s : %+v", podIdentifier, dnsProxyRules)
 	setDNSProxyRulesFromController(podIdentifier, "policyEndpoints", dnsProxyRules)
@@ -19,12 +28,28 @@ func SetPolicyEndpointDomains(podIdentifier string, domainFWRules []fwrp.EbpfFir
 
 // DeletePolicyEndpointDomains removes domains set by PolicyEndpointController
 func DeletePolicyEndpointDomains(podIdentifier string) {
+	PolicyMu.Lock()
+	defer PolicyMu.Unlock()
+	if c, ok := BpfClient.(interface{ ClearDNSForPod(string) error }); ok {
+		if err := c.ClearDNSForPod(podIdentifier); err != nil {
+			log().Errorf("DNS invalidation failed: %v", err)
+		}
+	}
+
 	deleteDomainsForController(podIdentifier, "policyEndpoints")
 }
 
 // SetClusterPolicyEndpointDomains sets domains from ClusterPolicyEndpointController
 // ClusterPolicyEndpointController will pass domainNames where Priority and Action needs to be honored
 func SetClusterPolicyEndpointDomains(podIdentifier string, domainFWRules []fwrp.EbpfFirewallRules) error {
+	PolicyMu.Lock()
+	defer PolicyMu.Unlock()
+	if c, ok := BpfClient.(interface{ ClearDNSForPod(string) error }); ok {
+		if err := c.ClearDNSForPod(podIdentifier); err != nil {
+			return fmt.Errorf("invalidate DNS grants: %w", err)
+		}
+	}
+
 	dnsProxyRules := ComputeDNSProxyRulesFromEbpfFirewallRulesForCPE(domainFWRules)
 	log().Debugf("DNS proxy rules for PodId %s : %+v", podIdentifier, dnsProxyRules)
 	setDNSProxyRulesFromController(podIdentifier, "clusterPolicyEndpoints", dnsProxyRules)
@@ -33,6 +58,14 @@ func SetClusterPolicyEndpointDomains(podIdentifier string, domainFWRules []fwrp.
 
 // DeletePolicyEndpointDomains removes domains set by PolicyEndpointController
 func DeleteClusterPolicyEndpointDomains(podIdentifier string) {
+	PolicyMu.Lock()
+	defer PolicyMu.Unlock()
+	if c, ok := BpfClient.(interface{ ClearDNSForPod(string) error }); ok {
+		if err := c.ClearDNSForPod(podIdentifier); err != nil {
+			log().Errorf("DNS invalidation failed: %v", err)
+		}
+	}
+
 	deleteDomainsForController(podIdentifier, "clusterPolicyEndpoints")
 }
 
@@ -48,6 +81,7 @@ func setDNSProxyRulesFromController(podIdentifier string, controllerId string, d
 	patternMap := make(domainL4Map)
 
 	for domain, l4Rule := range dnsProxyRules {
+		domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 		if strings.HasPrefix(domain, "*.") {
 			patternMap[domain] = l4Rule
 		} else {
@@ -153,6 +187,8 @@ func mergeAndCacheFilter(podId string) {
 func mergeL4Rules(existing, new []npatypes.L4Rule) []npatypes.L4Rule {
 	return append(existing, new...)
 }
+
+var PolicyMu sync.Mutex // Serializes policy invalidation with DNS authorization publication.
 
 var podControllerFilters sync.Map // podId -> map[controllerId]ControllerDomains
 var podMergedFilters sync.Map     // podId -> *Filter (cached merged result)

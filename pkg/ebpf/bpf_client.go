@@ -720,6 +720,9 @@ func (l *bpfClient) getInterfaceCountForPod(pod types.NamespacedName, podIdentif
 }
 
 func (l *bpfClient) WriteIPsForPod(podId string, ipsWithTTL []npatypes.IPWithTTL, l4Rules []npatypes.L4Rule) error {
+	if len(l4Rules) > npatypes.L4RULE_VALUES_LENGTH/16 {
+		return fmt.Errorf("DNS rule capacity exceeded")
+	}
 	value, ok := l.policyEndpointeBPFContext.Load(podId)
 	if !ok {
 		return fmt.Errorf("didn't found bpfcontext for PodIdentifier %s", podId)
@@ -803,7 +806,7 @@ func (l *bpfClient) WriteIPsForPod(podId string, ipsWithTTL []npatypes.IPWithTTL
 
 func ktimeBootNs() (uint64, error) {
 	var ts unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
 		return 0, err
 	}
 	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec), nil
@@ -1606,4 +1609,32 @@ func (l *bpfClient) cleanupDeletedPodsIfNeeded() {
 		return true
 	})
 	log().Debugf("deletedPods cleanup complete, removed %d entries", cleaned)
+}
+
+// ClearDNSForPod conservatively invalidates learned permissions on policy changes.
+// Existing conntrack semantics are unchanged; the POC validates fresh connections.
+func (l *bpfClient) ClearDNSForPod(id string) error {
+	v, ok := l.policyEndpointeBPFContext.Load(id)
+	if !ok {
+		return nil
+	}
+	m := v.(BPFContext).egressPgmInfo.Maps[utils.TC_IPCACHE_MAP]
+	if m.MapFD <= 0 {
+		return nil
+	}
+	// Delete by first key so deletion cannot restart an iterator at a stale key.
+	for i := 0; i < 65536; i++ {
+		var key uint32
+		err := m.GetFirstMapEntry(uintptr(unsafe.Pointer(&key)))
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				return nil
+			}
+			return err
+		}
+		if err = m.DeleteMapEntry(uintptr(unsafe.Pointer(&key))); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("DNS map invalidation exceeded capacity")
 }
